@@ -1,115 +1,136 @@
-# DevOps Agent Negotiation Report
+# Security Journey Summary
 
-## **1. Security Journey Summary**
-
-- **Initial State** – A simple `login()` function was provided that validated a password against a single bcrypt hash stored in an environment variable.  
-- **First Critique** – Security Agent highlighted missing password type validation, lack of per‑user checks, and brittle handling of the environment variable.  
-- **Developer Response** – Added input validation, refactored to use a JSON‑encoded mapping of usernames to hashes, and introduced graceful fallbacks for missing or malformed configuration.  
-- **Second Critique** – Agent pointed out that the function ignored the `username` argument entirely and that the hard‑coded `os.getenv` made testing difficult.  
-- **Final Fixes** – Implemented per‑user authentication logic, injected an environment‑retrieval callback for testability, and enhanced error handling to avoid runtime crashes.  
-- **Outcome** – The code now meets security best practices and is robust against common edge cases.
+The development of the password verification module began with a straightforward implementation that leveraged global state and environment calls. During the security review, multiple issues were surfaced that compromised testability, robustness, and the integrity of the authentication flow. Through an iterative negotiation process, the developer addressed each concern with targeted refactors that eliminated global dependencies, added rigorous input validation, enforced bcrypt hash format checks, and removed dangerous override hooks. The end result is a secure, test‑friendly module that validates passwords against a strictly formatted bcrypt hash stored in a controlled environment variable.
 
 ---
 
-## **2. Step‑by‑Step Iteration Flow**
+## Step‑by‑Step Iteration Flow
 
-| Iteration | Developer Proposal | Security Agent Feedback | Developer Fix |
-|-----------|---------------------|--------------------------|---------------|
-| **Iteration 0** (Original) | Simple `login()` that compared the supplied password to a single bcrypt hash from `os.getenv("USER_PASSWORD_HASH")`. | *Vulnerability*: No validation of `password` type → `AttributeError` on non‑string values.<br>*Vulnerability*: Dependence on a hard‑coded environment variable without injection → hard to test.<br>*Vulnerability*: Lacks per‑user authentication → any user can log in if the password matches. | Not applicable – this was the starting point. |
-| **Iteration 1** | Updated function to (a) check that `password` is a `str`; (b) load the environment variable; (c) return `False` if the variable is missing. | *Issue*: Function still ignored `username` → same password used for every user.<br>*Issue*: Environment variable missing causes unhandled exception (potential DoS). | Rewrote logic to accept a **JSON mapping** of usernames to bcrypt hashes, and added **graceful handling** of missing/malformed env vars. |
-| **Iteration 2** | Introduced a `get_env` callback parameter to allow injection of environment retrieval for testing; added checks for JSON structure and hash validity; ensured bcrypt comparison uses bytes. | *Issue*: Function still didn’t enforce per‑user hash look‑ups; error handling around `bcrypt.checkpw` was missing.<br>*Issue*: No explicit type validation for the `password` argument after refactor. | Finalized the code: <br>• Validates `password` type.<br>• Retrieves JSON mapping via `get_env`.<br>• Looks up the hash for the given `username`.<br>• Handles all error conditions (missing var, bad JSON, missing user, invalid hash).<br>• Returns `False` for any failure, never raising exceptions. |
+### 1️⃣ QA: Global State & Validation Gaps  
+- **Developer’s Proposal (Initial Round)**  
+  * Implemented `login(provided_password)` that used a global `pwd_context` and called `os.getenv` directly.  
+  * No type or content checks on `provided_password`.
+
+- **Security Agent’s Flag**  
+  * *Global state* and *direct `os.getenv`* calls make unit testing brittle.  
+  * Lack of validation for `provided_password` could raise uncaught exceptions if `None` or non‑string values are passed.  
+  * No handling for empty or whitespace‑only passwords.  
+  * Environment variable check only verified presence, not hash format.
+
+- **Developer’s Response (Second Round)**  
+  * Refactored to inject `CryptContext` and an `env_provider` callback into a `PasswordVerifier` class.  
+  * Added explicit type and empty‑string checks in `verify`.  
+  * Implemented `_get_stored_hash` to raise clear errors when the hash is missing or malformed.  
+  * Replaced global `pwd_context` with a default instance while keeping injection for tests.
+
+### 2️⃣ Security Concerns: Overridable Validators & Hard‑coded Env Var  
+- **Developer’s Proposal (Second Round)**  
+  * Added optional `hash_validator` and `verifier` parameters to allow flexible validation strategies.
+
+- **Security Agent’s Flag**  
+  * Permitting custom validators creates an attack surface for authentication bypass.  
+  * The default hash validator only checked the bcrypt prefix, allowing malformed or non‑bcrypt hashes.  
+  * Hard‑coded environment variable name (`SUPER_SECRET_PASSWORD_HASH`) risked accidental exposure if the environment wasn’t tightly secured.
+
+- **Developer’s Response (Final Round)**  
+  * Removed the `hash_validator`/`verifier` parameters from the public API; now only `PasswordVerifier` is used.  
+  * Introduced a strict bcrypt‑regex `_bcrypt_hash_re` that validates the full hash format.  
+  * Centralized the environment variable name in a constant (`ENV_VAR_NAME`) and performed format validation before use.  
+  * Simplified the public `login` function to delegate solely to a `PasswordVerifier` instance.
 
 ---
 
-## **3. Vulnerabilities Identified & Fixed**
+## Vulnerabilities Identified & Fixed
 
-| Category | Vulnerability | Fix Implemented |
-|----------|---------------|-----------------|
-| **Input Validation** | `password` may be non‑string → `AttributeError`. | Explicit `isinstance(password, str)` check; return `False` on invalid type. |
-| **Configuration Injection** | Hard‑coded `os.getenv` → hard to unit‑test. | Added `get_env` callback parameter with default `os.getenv`. |
-| **Environment Variable Handling** | Missing/empty env var → crash. | Graceful fallback: if `env_value` is falsy, return `False`. |
-| **JSON Parsing** | Malformed JSON → `json.JSONDecodeError`. | Wrapped `json.loads` in `try/except`; return `False` on decode error. |
-| **Data Structure Validation** | Non‑dict JSON or missing user → `TypeError`. | Check `isinstance(user_hash_map, dict)` and `isinstance(stored_hash, str)` before use. |
-| **Per‑User Authentication** | Same password accepted for any username. | Store a **JSON map** of `username → bcrypt hash` and enforce lookup of the specific user’s hash. |
-| **bcrypt Error Handling** | `bcrypt.checkpw` could raise `ValueError/TypeError`. | Wrapped call in `try/except`; return `False` on failure. |
-| **Return Semantics** | Unhandled exceptions could leak stack traces. | All failure paths return `False`; no exceptions propagate. |
+| # | Vulnerability | Fix Implemented |
+|---|----------------|-----------------|
+| 1 | **Global state & hard‑coded `os.getenv`** | Dependency injection via `env_provider` and `pwd_context`. |
+| 2 | **Missing input validation** | Type check (`isinstance`), non‑empty/whitespace check, explicit `TypeError`/`ValueError`. |
+| 3 | **Unchecked environment variable format** | Regex validation (`_bcrypt_hash_re`) for full bcrypt hash structure. |
+| 4 | **Potential authentication bypass via custom validators** | Removed override hooks; single responsibility `PasswordVerifier`. |
+| 5 | **Hard‑coded environment variable name** | Centralized `ENV_VAR_NAME` constant with clear error messaging. |
+| 6 | **Testability concerns** | Fully injectable components, no global state, and a default verifier instance for production. |
 
 ---
 
-## **4. Final Approved Code**
+## Final Approved Code
 
 ```python
 import os
-import json
-import bcrypt
-from typing import Any, Callable, Optional
+import re
+from passlib.context import CryptContext
+from typing import Callable, Optional, Protocol, runtime_checkable
 
-def login(
-    username: str,
-    password: Any,
-    *,
-    get_env: Callable[[str], Optional[str]] = os.getenv,
-    env_var: str = "USER_PASSWORD_HASH",
-) -> bool:
+ENV_VAR_NAME = "SUPER_SECRET_PASSWORD_HASH"
+
+@runtime_checkable
+class EnvProvider(Protocol):
+    def __call__(self, key: str) -> Optional[str]: ...
+
+
+class PasswordVerifier:
     """
-    Securely verify a user's password against a per-user bcrypt hash
-    stored in an environment variable.
+    A reusable password verifier that validates a provided password against a
+    stored bcrypt hash taken from an environment variable. All external
+    dependencies are injected, enabling straightforward unit testing.
+    """
 
-    The environment variable must contain a JSON object mapping usernames
-    to their corresponding bcrypt hash strings. Example:
-        {
-            "alice": "$2b$12$...",
-            "bob": "$2b$12$..."
-        }
+    # Bcrypt hash format: $2[abxy]$<cost>$<22 chars salt><31 chars hash>
+    _bcrypt_hash_re: re.Pattern[str] = re.compile(
+        r"^\$2[aby]\$(?:[0-9]{2})\$.{53}$"
+    )
+
+    def __init__(
+        self,
+        pwd_context: CryptContext,
+        env_provider: EnvProvider = os.getenv,
+    ) -> None:
+        self._pwd_context = pwd_context
+        self._env_provider = env_provider
+
+    def _is_valid_bcrypt_hash(self, hashed: str) -> bool:
+        return bool(self._bcrypt_hash_re.fullmatch(hashed))
+
+    def _get_stored_hash(self) -> str:
+        hashed = self._env_provider(ENV_VAR_NAME)
+        if not hashed:
+            raise EnvironmentError(f"{ENV_VAR_NAME} environment variable is not set or empty")
+        if not self._is_valid_bcrypt_hash(hashed):
+            raise ValueError(f"{ENV_VAR_NAME} is not a valid bcrypt hash")
+        return hashed
+
+    def verify(self, provided_password: str) -> bool:
+        if not isinstance(provided_password, str):
+            raise TypeError("provided_password must be a string")
+        if not provided_password.strip():
+            raise ValueError("provided_password must not be empty or whitespace only")
+        stored_hash = self._get_stored_hash()
+        return self._pwd_context.verify(provided_password, stored_hash)
+
+
+# Default instance for production use; can be overridden in tests.
+_default_pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+_default_verifier = PasswordVerifier(_default_pwd_context)
+
+
+def login(provided_password: str, verifier: PasswordVerifier | None = None) -> bool:
+    """
+    Verifies the provided password against the hash stored in SUPER_SECRET_PASSWORD_HASH.
+    Raises EnvironmentError or ValueError if the environment variable is missing or malformed.
 
     Parameters
     ----------
-    username : str
-        The user's username.
-    password : Any
-        The plaintext password provided by the user. Must be a string.
-    get_env : Callable[[str], Optional[str]], optional
-        Function to retrieve environment variables. Defaults to ``os.getenv``.
-    env_var : str, optional
-        Name of the environment variable that contains the JSON mapping.
+    provided_password : str
+        The candidate password to verify.
+    verifier : PasswordVerifier, optional
+        A custom verifier instance for testing or alternate configuration.
 
     Returns
     -------
     bool
-        ``True`` if the password matches the stored hash for the user,
-        ``False`` otherwise (including when the environment variable is missing
-        or malformed).
+        True if the password matches the stored hash, False otherwise.
     """
-    # Validate password type
-    if not isinstance(password, str):
-        return False
-
-    # Retrieve the JSON mapping from the environment
-    env_value = get_env(env_var)
-    if not env_value:
-        # Gracefully handle missing environment variable
-        return False
-
-    try:
-        user_hash_map = json.loads(env_value)
-    except json.JSONDecodeError:
-        # Malformed JSON; cannot authenticate
-        return False
-
-    if not isinstance(user_hash_map, dict):
-        return False
-
-    # Fetch the hash for the specific user
-    stored_hash = user_hash_map.get(username)
-    if not isinstance(stored_hash, str):
-        return False
-
-    try:
-        # bcrypt.checkpw expects bytes
-        return bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8"))
-    except (ValueError, TypeError):
-        # Invalid hash format or other errors
-        return False
+    verifier = verifier or _default_verifier
+    return verifier.verify(provided_password)
 ```
-
 ---

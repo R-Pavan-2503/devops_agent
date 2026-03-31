@@ -106,6 +106,9 @@ def code_quality_agent_node(state: AgentState):
     code = state.get("current_code", "")
     messages = [SystemMessage(content=CODE_QUALITY_AGENT_PROMPT), HumanMessage(content=code)]
     ai_review = strict_security_llm.invoke(messages)
+    print(f"   -> Vote: {ai_review.vote}")
+    print(f"   -> Critique: {ai_review.critique}")
+
     return {
         "domain_approvals": {"code_quality": ai_review.vote},
         "critique_log": [f"Code Quality: {ai_review.critique}"]
@@ -116,6 +119,9 @@ def architecture_agent_node(state: AgentState):
     code = state.get("current_code", "")
     messages = [SystemMessage(content=ARCHITECTURE_AGENT_PROMPT), HumanMessage(content=code)]
     ai_review = strict_security_llm.invoke(messages)
+    print(f"   -> Vote: {ai_review.vote}")
+    print(f"   -> Critique: {ai_review.critique}")
+
     return {
         "domain_approvals": {"architecture": ai_review.vote},
         "critique_log": [f"Architecture: {ai_review.critique}"]
@@ -126,6 +132,10 @@ def qa_agent_node(state: AgentState):
     code = state.get("current_code", "")
     messages = [SystemMessage(content=QA_AGENT_PROMPT), HumanMessage(content=code)]
     ai_review = strict_security_llm.invoke(messages)
+    
+    print(f"   -> Vote: {ai_review.vote}")
+    print(f"   -> Critique: {ai_review.critique}")
+
     return {
         "domain_approvals": {"qa": ai_review.vote},
         "critique_log": [f"QA: {ai_review.critique}"]
