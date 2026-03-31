@@ -12,6 +12,7 @@ class AgentState(TypedDict):
     pr_url: str
     ado_ticket_id: str
     uac_context: str 
+    current_code: str
     
     # Smart Routing Flags
     pr_type: str 
