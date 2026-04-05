@@ -9,3 +9,6 @@ wheels/
 .env
 # Virtual environments
 .venv
+
+# ChromaDB local vector store (can be large, regenerate with bulk_ingest.py)
+chroma_db/
