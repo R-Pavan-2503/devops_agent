@@ -1,3 +1,4 @@
+from langchain_core import output_parsers
 import sys
 from dotenv import load_dotenv
 import asyncio
@@ -13,7 +14,7 @@ print("\n[START] Starting Simulated PR Review Pipeline...")
 initial_state = {
     "pr_url": "https://github.com/fake/repo/pull/1",
     # Here we simulate an incoming piece of code
-    "current_code": "def connect_to_database():\n    password = 'admin'\n    db.connect('root', password)",
+    "current_code": "import sqlite3\n\nDB_PASSWORD = \"super_secret_password_123\"\n\nclass UserService:\n    def init(self):\n        self.db = sqlite3.connect(\"users.db\")\n\n    def get_user(self, id):\n        cursor = self.db.cursor()\n        query = f\"SELECT * FROM users WHERE id = {id}\"\n        cursor.execute(query)\n        res = cursor.fetchone()\n        \n        if res == None:\n            return \"Not found\"\n            \n        return \"User data: \" + str(res)",
     "iteration_count": 0,
     "ast_is_valid": True,
     # 🔑 This is the key piece! We tell the agents which vector store repo to query:
@@ -22,8 +23,11 @@ initial_state = {
         "security": "pending",
         "architecture": "pending",
         "code_quality": "pending",
-        "qa": "pending"
-    }
+        "qa": "pending",
+        "frontend": "pending"
+    },
+    "active_critiques": [],
+    "full_history": []
 }
 
 print(f"[TEST] Simulating an incoming pull request for repository: {initial_state['repo_name']}\n")

@@ -1,6 +1,12 @@
 from typing import Annotated, TypedDict
 import operator
 
+# Custom reducer: an empty list [] acts as a 'wipe' signal for short-term memory
+def wipeable_add(existing: list, new: list) -> list:
+    if new == []:
+        return []
+    return existing + new
+
 # Custom reducer to merge specialist votes 
 def merge_votes(dict1: dict, dict2: dict) -> dict:
     if not dict1:
@@ -27,7 +33,8 @@ class AgentState(TypedDict):
     domain_approvals: Annotated[dict, merge_votes] 
     
     # Execution & Negotiation Logs
-    critique_log: Annotated[list[str], operator.add]
+    active_critiques: Annotated[list[str], wipeable_add]  # Short-term: current round only, wipeable
+    full_history: Annotated[list[str], operator.add]      # Long-term: entire journey, never erased
     human_readable_summary: str 
     
     # Cyclic Control & Mitigations
