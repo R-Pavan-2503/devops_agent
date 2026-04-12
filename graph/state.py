@@ -1,4 +1,4 @@
-from typing import Annotated, TypedDict
+from typing import Annotated, TypedDict, Optional
 import operator
 
 # Custom reducer: an empty list [] acts as a 'wipe' signal for short-term memory
@@ -12,6 +12,12 @@ def merge_votes(dict1: dict, dict2: dict) -> dict:
     if not dict1:
         return dict2
     return {**dict1, **dict2}
+
+# Custom reducer: only update if new value is non-empty (preserves cached context across rounds)
+def preserve_if_set(existing: str, new: str) -> str:
+    if new:
+        return new
+    return existing
 
 class AgentState(TypedDict):
     # Ingestion Inputs
@@ -41,3 +47,8 @@ class AgentState(TypedDict):
     iteration_count: int
     requires_summarization: bool 
     tie_breaker_invoked: bool
+
+    # Codebase context cache: Architecture Agent fetches this ONCE in Round 1.
+    # Subsequent rounds reuse it without re-querying ChromaDB.
+    # reducer: only update when a non-empty value is returned (preserve_if_set)
+    arch_codebase_context: Annotated[str, preserve_if_set]

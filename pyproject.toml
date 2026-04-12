@@ -10,6 +10,7 @@ dependencies = [
     "fastapi>=0.135.2",
     "httpx>=0.28.1",
     "langchain-core>=1.2.22",
+    "langchain-google-genai>=4.2.1",
     "langchain-xai>=1.2.2",
     "langgraph>=1.1.3",
     "pydantic>=2.12.5",

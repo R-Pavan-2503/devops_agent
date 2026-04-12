@@ -10,15 +10,25 @@ from graph.builder import app
 
 print("\n[START] Starting Simulated PR Review Pipeline...")
 
+TEST_FILE_PATH = "test_files/login.tsx"
+REPO_NAME = "frontend_pandhi"
+
+try:
+    with open(TEST_FILE_PATH, "r", encoding="utf-8") as f:
+        code_content = f.read()
+except Exception as e:
+    print(f"Error reading {TEST_FILE_PATH}: {e}")
+    sys.exit(1)
+
 # This initial state mimics what the webhook + Celery worker would pass in
 initial_state = {
-    "pr_url": "https://github.com/fake/repo/pull/1",
+    "pr_url": f"https://github.com/fake/{REPO_NAME}/pull/1",
     # Here we simulate an incoming piece of code
-    "current_code": "import sqlite3\n\nDB_PASSWORD = \"super_secret_password_123\"\n\nclass UserService:\n    def init(self):\n        self.db = sqlite3.connect(\"users.db\")\n\n    def get_user(self, id):\n        cursor = self.db.cursor()\n        query = f\"SELECT * FROM users WHERE id = {id}\"\n        cursor.execute(query)\n        res = cursor.fetchone()\n        \n        if res == None:\n            return \"Not found\"\n            \n        return \"User data: \" + str(res)",
+    "current_code": code_content,
     "iteration_count": 0,
     "ast_is_valid": True,
     # 🔑 This is the key piece! We tell the agents which vector store repo to query:
-    "repo_name": "backend_pandhi",
+    "repo_name": REPO_NAME,
     "domain_approvals": {
         "security": "pending",
         "architecture": "pending",

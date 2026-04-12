@@ -35,18 +35,16 @@ def search_codebase_context(search_query: str, repo_name: str) -> str:
                       Must match the repo_name used during ingestion.
 
     Returns:
-        A formatted string of the top 3 most semantically relevant code blocks,
-        each prefixed with its file path and language metadata.
+        A short summary of the single most relevant code block found.
     """
-    results = search(query=search_query, repo_name=repo_name, n_results=3)
+    results = search(query=search_query, repo_name=repo_name, n_results=1)
 
     if not results:
         return (
             f"No relevant code found in repository '{repo_name}' "
-            f"for query: '{search_query}'. "
-            "The repository may not have been ingested yet — run "
-            "`python scripts/bulk_ingest.py` to populate the vector store."
+            f"for query: '{search_query}'."
         )
 
-    separator = "\n\n" + "=" * 60 + "\n\n"
-    return separator.join(results)
+    # Truncate to 500 chars max to keep token usage minimal
+    snippet = results[0][:500]
+    return f"[Context for '{search_query}']:\n{snippet}"
