@@ -1,7 +1,5 @@
-from langchain_core import output_parsers
 import sys
 from dotenv import load_dotenv
-import asyncio
 
 load_dotenv()
 
@@ -10,8 +8,9 @@ from graph.builder import app
 
 print("\n[START] Starting Simulated PR Review Pipeline...")
 
-TEST_FILE_PATH = "test_files/login.tsx"
-REPO_NAME = "frontend_pandhi"
+TEST_FILE_PATH      = "test_files/login.go"
+TEST_FILE_TEST_PATH = "test_files/login_test.go"   # Companion unit test file
+REPO_NAME           = "frontend_pandhi"
 
 try:
     with open(TEST_FILE_PATH, "r", encoding="utf-8") as f:
@@ -23,11 +22,13 @@ except Exception as e:
 # This initial state mimics what the webhook + Celery worker would pass in
 initial_state = {
     "pr_url": f"https://github.com/fake/{REPO_NAME}/pull/1",
-    # Here we simulate an incoming piece of code
+    # The production source code to be reviewed
     "current_code": code_content,
+    # Path to companion unit tests — QA agent uses this to estimate coverage
+    "test_file_path": TEST_FILE_TEST_PATH,
     "iteration_count": 0,
     "ast_is_valid": True,
-    # 🔑 This is the key piece! We tell the agents which vector store repo to query:
+    # Tells the Architect agent which vector store repo to query
     "repo_name": REPO_NAME,
     "domain_approvals": {
         "security": "pending",

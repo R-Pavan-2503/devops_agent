@@ -23,9 +23,10 @@ class AgentState(TypedDict):
     # Ingestion Inputs
     pr_url: str
     ado_ticket_id: str
-    uac_context: str 
+    uac_context: str
     current_code: str
     repo_name: str          # The repo identifier used in vector store lookups
+    test_file_path: str     # Path to the companion unit test file (e.g. login_test.go)
     
     # Smart Routing Flags
     pr_type: str 

@@ -34,7 +34,7 @@ load_dotenv()
 arch_llm = ChatOpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1",
-    model="llama-3.3-70b-versatile",
+    model="openai/gpt-oss-120b",
     max_tokens=3000
 )
 
@@ -102,8 +102,14 @@ def invoke_strict(messages, llm_instance, max_retries=3):
                     else:
                         content = content_inner
 
+            # Fallback for single-word responses avoiding TOON format completely
+            if content.upper() in ["APPROVE", "APPROVED"]:
+                return SpecialistReview(vote="approved", critique="")
+            elif content.upper() in ["REJECT", "REJECTED"]:
+                return SpecialistReview(vote="rejected", critique="No explicit critique provided.")
+
             lines = content.split("\n")
-            vote = "rejected"
+            vote = None
             critique = ""
             for line in lines:
                 if line.lower().startswith("vote:"):
@@ -113,6 +119,24 @@ def invoke_strict(messages, llm_instance, max_retries=3):
                     critique = line[9:].strip()
                 elif line.strip() and not critique and not line.lower().startswith("vote:"):
                     critique += line.strip() + " "
+
+            if vote is None:
+                # If they skipped the vote: block, fallback to checking the whole content
+                if "approve" in content.lower():
+                    vote = "approved"
+                else:
+                    vote = "rejected"
+                    if not critique:
+                        critique = content.strip()
+                        
+            # Prevent edge cases where the LLM writes "Critique: REJECT"
+            if critique.upper() in ["APPROVE", "APPROVED", "REJECT", "REJECTED"]:
+                if critique.upper() in ["APPROVE", "APPROVED"]:
+                    vote = "approved"
+                    critique = ""
+                else:
+                    vote = "rejected"
+                    critique = "Code rejected. Rule violation."
 
             return SpecialistReview(vote=vote, critique=critique.strip())
 
@@ -341,21 +365,51 @@ def code_quality_agent_node(state: AgentState):
 
 def qa_agent_node(state: AgentState):
     """
-    QA / SDET Agent — Testability Checker.
+    QA / SDET Agent — Test Coverage & Testability Checker.
+
+    Coverage Gate (70–80% sweet spot):
+        Reads both the production source code (current_code) and the
+        companion unit-test file (test_file_path from state).
+        REJECTS if estimated branch coverage < 70% (insufficient) or
+        > 80% (gold-plating). APPROVES only within the 70–80% range.
 
     Why NO ChromaDB:
-        Checks if the NEW code is testable: dependency injection used?
-        Are interfaces abstracted? Is there input validation? These are
-        universal testability patterns checked against the PR code alone.
-        Uses Llama-4-Scout which has a separate 500K TPD bucket.
+        Coverage estimation is performed purely against the two supplied
+        files — no existing-codebase comparison is needed.
+        Uses Llama-4-Scout for a separate 500K TPD token bucket.
     """
     time.sleep(2)
-    print(" QA Agent: Checking testability and mocks...")
+    print(" QA Agent: Checking test coverage (70-80% gate) and testability...")
 
-    code = state.get("current_code", "")
+    source_code = state.get("current_code", "")
+
+    # ---------------------------------------------------------------
+    # Load the companion test file so the LLM can count covered
+    # branches and estimate actual coverage percentage.
+    # ---------------------------------------------------------------
+    test_file_path = state.get("test_file_path", "")
+    test_code = ""
+    if test_file_path:
+        try:
+            with open(test_file_path, "r", encoding="utf-8") as f:
+                test_code = f.read()
+            print(f"   [QA] Loaded test file: {test_file_path}")
+        except FileNotFoundError:
+            print(f"   [QA] WARNING: test file not found at '{test_file_path}'. Coverage check degraded.")
+        except Exception as e:
+            print(f"   [QA] WARNING: could not read test file: {e}")
+    else:
+        print("   [QA] No test_file_path in state — coverage check limited to testability only.")
+
+    # Build a two-block human message so the LLM sees source vs tests clearly
+    human_content = (
+        f"SOURCE CODE:\n```\n{source_code}\n```\n\n"
+        f"TEST CODE:\n```\n{test_code if test_code else '(no test file provided)'}\n```"
+    )
+
     messages = [
         SystemMessage(content=QA_AGENT_PROMPT),
-        HumanMessage(content=code)
+        HumanMessage(content=human_content)
     ]
     ai_review = invoke_strict(messages, review_llm_scout)
 

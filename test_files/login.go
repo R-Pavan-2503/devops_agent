@@ -1,154 +1,216 @@
-// Package login provides HTTP handler for user authentication.
-// It follows clean architecture principles: the handler layer only
-// deals with HTTP concerns; database access is hidden behind a
-// UserRepository interface for full testability.
-package login
+package api
 
 import (
-	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"net/mail"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 )
 
-// ─── Domain types ────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
+// Interfaces & Dependencies (Architecture Fix)
+// -------------------------------------------------------------------------
 
-// loginRequest is decoded from the JSON request body.
-type loginRequest struct {
-	Username string `json:"username"`
+// UserRepo defines the interface for database operations
+type UserRepo interface {
+	FindByEmail(email string) (*User, error)
+}
+
+// TokenService defines the interface for generating tokens
+type TokenService interface {
+	Generate(userID int, email string) (string, error)
+}
+
+// AuthHandler wraps the dependencies for the login logic
+type AuthHandler struct {
+	Repo         UserRepo
+	TokenService TokenService
+}
+
+// -------------------------------------------------------------------------
+// Domain Models
+// -------------------------------------------------------------------------
+
+type User struct {
+	ID           int
+	Email        string
+	PasswordHash string
+}
+
+type LoginRequest struct {
+	Email    string `json:"email"`
 	Password string `json:"password"`
 }
 
-// successResponse is returned on a successful authentication.
-type successResponse struct {
-	Data struct {
-		ID        int       `json:"id"`
-		Status    string    `json:"status"`
-		CreatedAt time.Time `json:"created_at"`
-	} `json:"data"`
+type LoginResponse struct {
+	Token   string `json:"token"`
+	Message string `json:"message"`
 }
 
-// errorResponse is returned on any failure.
-type errorResponse struct {
-	Error struct {
-		Code         int    `json:"code"`
-		ErrorMessage string `json:"error_message"`
-	} `json:"error"`
-}
+// -------------------------------------------------------------------------
+// Logic & Handlers
+// -------------------------------------------------------------------------
 
-// ─── Repository interface (enables full unit-test mocking) ───────────────────
+func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
+	// Defensive nil checks for dependencies
+	if h.Repo == nil {
+		h.sendError(w, http.StatusInternalServerError, "Internal server error")
+		log.Println("AuthHandler Repo dependency is nil")
+		return
+	}
+	if h.TokenService == nil {
+		h.sendError(w, http.StatusInternalServerError, "Internal server error")
+		log.Println("AuthHandler TokenService dependency is nil")
+		return
+	}
 
-// UserRepository abstracts all database access needed by LoginHandler.
-// Tests inject a fake implementation; production code uses sqlUserRepository.
-type UserRepository interface {
-	// FindByUsername returns (id, passwordHash, nil) when the user exists,
-	// or (0, "", sql.ErrNoRows) when not found, or another error on DB failure.
-	FindByUsername(username string) (id int, passwordHash string, err error)
-}
+	// Ensure request body is closed safely
+	if r.Body != nil {
+		defer r.Body.Close()
+	}
 
-// ─── Production repository (depends on *sql.DB, injected at startup) ─────────
-
-// sqlUserRepository is the real MySQL-backed implementation.
-type sqlUserRepository struct {
-	db *sql.DB
-}
-
-// NewSQLUserRepository constructs a production UserRepository.
-// The caller owns the *sql.DB connection pool and must close it.
-func NewSQLUserRepository(db *sql.DB) UserRepository {
-	return &sqlUserRepository{db: db}
-}
-
-// FindByUsername executes a single parameterized query to prevent SQL injection.
-func (r *sqlUserRepository) FindByUsername(username string) (int, string, error) {
-	var id int
-	var hash string
-	err := r.db.QueryRow(
-		"SELECT id, password_hash FROM users WHERE username = ?", username,
-	).Scan(&id, &hash)
-	return id, hash, err
-}
-
-// ─── HTTP Handler (pure function, no global state) ───────────────────────────
-
-// LoginHandler handles POST /login.
-// It is a plain struct so the repository can be injected via the constructor,
-// keeping this handler fully unit-testable without any real database.
-type LoginHandler struct {
-	repo UserRepository
-}
-
-// NewLoginHandler creates a LoginHandler with the given repository.
-func NewLoginHandler(repo UserRepository) *LoginHandler {
-	return &LoginHandler{repo: repo}
-}
-
-// ServeHTTP implements http.Handler.
-func (h *LoginHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// ── Enforce POST ─────────────────────────────────────────────────────────
 	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		h.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
 
-	// ── Decode & validate request body ───────────────────────────────────────
-	var req loginRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.Username == "" || req.Password == "" {
-		writeError(w, http.StatusUnprocessableEntity, "username and password are required")
+	// Limit request body size to prevent abuse (1 MB)
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
+	var req LoginRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		h.sendError(w, http.StatusBadRequest, "Invalid JSON payload")
 		return
 	}
 
-	// ── Look up user ─────────────────────────────────────────────────────────
-	id, storedHash, err := h.repo.FindByUsername(req.Username)
+	// Trim and normalize inputs
+	req.Email = strings.TrimSpace(strings.ToLower(req.Email))
+	req.Password = strings.TrimSpace(req.Password)
+
+	// Basic validation without revealing which field is missing/invalid
+	if req.Email == "" || req.Password == "" {
+		h.sendError(w, http.StatusBadRequest, "Email and password must be provided")
+		return
+	}
+	if _, err := mail.ParseAddress(req.Email); err != nil {
+		h.sendError(w, http.StatusBadRequest, "Invalid email format")
+		return
+	}
+
+	// 1. Fetch User
+	user, err := h.Repo.FindByEmail(req.Email)
+	if err != nil || user == nil {
+		// Generic error to avoid user enumeration
+		h.sendError(w, http.StatusUnauthorized, "Invalid credentials")
+		return
+	}
+	if user.PasswordHash == "" {
+		h.sendError(w, http.StatusUnauthorized, "Invalid credentials")
+		return
+	}
+
+	// 2. Verify Password using constant‑time compare via bcrypt
+	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)) != nil {
+		h.sendError(w, http.StatusUnauthorized, "Invalid credentials")
+		return
+	}
+
+	// 3. Generate Token
+	token, err := h.TokenService.Generate(user.ID, user.Email)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			// Return 401 (not 404) to avoid username enumeration
-			writeError(w, http.StatusUnauthorized, "invalid username or password")
-			return
-		}
-		log.Printf("[LoginHandler] db error: %v", err)
-		writeError(w, http.StatusInternalServerError, "internal server error")
+		// Log internal error without leaking details to client
+		log.Printf("Token generation failed: %v", err)
+		h.sendError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
 
-	// ── Verify password (constant-time bcrypt comparison) ────────────────────
-	if err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(req.Password)); err != nil {
-		writeError(w, http.StatusUnauthorized, "invalid username or password")
-		return
-	}
+	// 4. Success Response with security headers
+	h.writeJSON(w, http.StatusOK, LoginResponse{
+		Token:   token,
+		Message: "Login successful",
+	})
+}
 
-	// ── Return success payload ────────────────────────────────────────────────
-	var resp successResponse
-	resp.Data.ID = id
-	resp.Data.Status = "success"
-	resp.Data.CreatedAt = time.Now().UTC()
+func (h *AuthHandler) sendError(w http.ResponseWriter, code int, msg string) {
+	h.writeJSON(w, code, map[string]string{"error": msg})
+}
 
+// writeJSON centralises JSON response handling and adds security headers.
+func (h *AuthHandler) writeJSON(w http.ResponseWriter, status int, payload interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		log.Printf("[LoginHandler] response encoding error: %v", err)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		log.Printf("Failed to write JSON response: %v", err)
 	}
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
+// Implementations (Security & Quality Fixes)
+// -------------------------------------------------------------------------
 
-// writeError serialises a consistent JSON error envelope and sets the status code.
-func writeError(w http.ResponseWriter, code int, message string) {
-	var resp errorResponse
-	resp.Error.Code = code
-	resp.Error.ErrorMessage = message
+type JWTService struct {
+	secret        []byte
+	expirationSec int64
+}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		log.Printf("[LoginHandler] error encoding error response: %v", err)
+// NewJWTService creates a JWTService using environment configuration.
+// It validates that the secret is set and meets a minimum length requirement.
+func NewJWTService() (*JWTService, error) {
+	secret := os.Getenv("JWT_SECRET")
+	if secret == "" {
+		return nil, errors.New("JWT_SECRET environment variable is not set")
 	}
+	if len([]byte(secret)) < 32 {
+		return nil, errors.New("JWT_SECRET must be at least 32 bytes for sufficient entropy")
+	}
+
+	expStr := os.Getenv("JWT_EXP_SECONDS")
+	var exp int64 = 86400 // default 24h
+	if expStr != "" {
+		parsed, err := strconv.ParseInt(expStr, 10, 64)
+		if err != nil || parsed <= 0 {
+			return nil, fmt.Errorf("invalid JWT_EXP_SECONDS value: %s", expStr)
+		}
+		exp = parsed
+	}
+	return &JWTService{
+		secret:        []byte(secret),
+		expirationSec: exp,
+	}, nil
+}
+
+// Generate creates a signed JWT containing standard claims and the user's email.
+func (s *JWTService) Generate(userID int, email string) (string, error) {
+	now := time.Now().UTC()
+	claims := jwt.MapClaims{
+		"sub":   userID,
+		"email": email,
+		"iat":   now.Unix(),
+		"nbf":   now.Unix(),
+		"exp":   now.Add(time.Duration(s.expirationSec) * time.Second).Unix(),
+		"aud":   "myapp",
+		"iss":   "myapp",
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString(s.secret)
+	if err != nil {
+		return "", err
+	}
+	return signed, nil
 }
