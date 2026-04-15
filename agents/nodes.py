@@ -173,6 +173,15 @@ def safe_print_critique(critique: str):
     safe_str = critique.encode("ascii", errors="replace").decode("ascii")
     print(f"   -> Critique: {safe_str}")
 
+def format_files_for_llm(files_dict) -> str:
+    if not isinstance(files_dict, dict):
+        return str(files_dict)
+    
+    formatted = ""
+    for filepath, content in files_dict.items():
+        formatted += f"\n--- FILE: {filepath} ---\n{content}\n"
+    return formatted.strip()
+
 
 # =============================================================================
 # AGENT NODES
@@ -192,7 +201,7 @@ def security_agent_node(state: AgentState):
     time.sleep(2)
     print(" Security Agent: Scanning code for vulnerabilities...")
 
-    code = state.get("current_code", "")
+    code = format_files_for_llm(state.get("current_files", {}))
     messages = [
         SystemMessage(content=SECURITY_AGENT_PROMPT),
         HumanMessage(content=f"Review this pull request code for security vulnerabilities:\n\n{code}")
@@ -228,7 +237,7 @@ def architecture_agent_node(state: AgentState):
     time.sleep(2)
     print(" Architecture Agent: Checking structural design (with codebase context)...")
 
-    code = state.get("current_code", "")
+    code = format_files_for_llm(state.get("current_files", {}))
     repo_name = state.get("repo_name", "")
     cached_context = state.get("arch_codebase_context", "")
 
@@ -328,7 +337,7 @@ def backend_analyst_node(state: AgentState):
         
     print(" Backend Analyst: Checking functional logic and efficiency...")
 
-    code = state.get("current_code", "")
+    code = format_files_for_llm(state.get("current_files", {}))
     uac_context = state.get("uac_context", "").strip()
 
     uac_block = (
@@ -365,7 +374,7 @@ def code_quality_agent_node(state: AgentState):
     time.sleep(2)
     print(" Code Quality Agent: Checking for clean code...")
 
-    code = state.get("current_code", "")
+    code = format_files_for_llm(state.get("current_files", {}))
     messages = [
         SystemMessage(content=CODE_QUALITY_AGENT_PROMPT),
         HumanMessage(content=code)
@@ -399,7 +408,7 @@ def qa_agent_node(state: AgentState):
     time.sleep(2)
     print(" QA Agent: Checking testability and mocks...")
 
-    code = state.get("current_code", "")
+    code = format_files_for_llm(state.get("current_files", {}))
     uac_context = state.get("uac_context", "").strip()
 
     uac_block = (
@@ -449,7 +458,7 @@ def frontend_agent_node(state: AgentState):
 
     print(" Frontend Agent: Checking API contract and formatting...")
 
-    code = state.get("current_code", "")
+    code = format_files_for_llm(state.get("current_files", {}))
     messages = [
         SystemMessage(content=FRONTEND_AGENT_PROMPT),
         HumanMessage(content=code)
@@ -476,7 +485,7 @@ def development_agent_node(state: AgentState):
     time.sleep(2)
     print("Development Agent: Rewriting the code to fix issues...")
 
-    broken_code = state.get("current_code", "")
+    broken_code = format_files_for_llm(state.get("current_files", {}))
     current_count = state.get("iteration_count", 0)
     critique_log = state.get("active_critiques", [])
 
@@ -485,8 +494,8 @@ def development_agent_node(state: AgentState):
     human_content = (
         f"Feedback from all reviewers:\n{chr(10).join(critique_log)}\n\n"
         f"{warning_text}"
-        f"Please fix this code:\n\n{broken_code}\n\n"
-        "CRITICAL: First provide your CHECKLIST, then provide the full rewritten source code enclosed in triple backticks. Do not use any tool calls or wrappers."
+        f"Please fix this codebase:\n\n{broken_code}\n\n"
+        "CRITICAL: First provide your CHECKLIST, then provide the full rewritten source code enclosed in triple backticks for each file you modify. DO NOT wrap the entire response in a single block, but use [FILE: path] followed by a backtick block for EACH file. Do not use any tool calls or wrappers."
     )
     messages = [
         SystemMessage(content=DEV_AGENT_PROMPT),
@@ -498,28 +507,44 @@ def development_agent_node(state: AgentState):
 
     new_code = response.content
     checklist = ""
-
-    # Parse checklist and code. The code must be inside triple backticks.
-    if "```" in new_code:
-        parts = new_code.split("```")
-        if len(parts) >= 3:
-            checklist = parts[0].strip()
-            content = parts[1]
-            # Remove language identifier like 'python' or 'go'
-            lines = content.split("\n")
-            if lines and not lines[0].strip().startswith(" ") and len(lines[0].strip().split()) == 1:
-                content = "\n".join(lines[1:])
-            new_code = content.strip()
-
+    
+    # Parse multi-file output: Look for [FILE: path] and ``` blocks
+    import re
+    # We first extract checklist - anything before the first [FILE:
+    parts = new_code.split("[FILE:", 1)
+    if len(parts) > 1:
+        checklist = parts[0].strip()
+        file_content_part = "[FILE:" + parts[1]
+    else:
+        file_content_part = new_code
+    
     if checklist:
         safe_checklist = checklist.encode("ascii", errors="replace").decode("ascii")
         print(f"\n   -> Verification Checklist:\n{safe_checklist}\n")
 
-    safe_code = new_code.encode("ascii", errors="replace").decode("ascii")
-    print(f"   -> Wrote new code:\n{safe_code[:200]}... [truncated for display]\n")
+    current_files = state.get("current_files", {})
+    file_blocks = re.findall(r"\[FILE:\s*(.*?)\s*\]\n*(?:```[\w]*\n)?(.*?)```", file_content_part, re.DOTALL)
+    
+    for filepath, file_content in file_blocks:
+        filepath = filepath.strip()
+        # Remove trailing/leading newlines from code if any
+        file_content = file_content.strip()
+        
+        # Write to state dict
+        current_files[filepath] = file_content
+        
+        # Physical write to disk
+        try:
+            # Create directories if they don't exist
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(file_content)
+            print(f"   -> Overwrote local file: {filepath}")
+        except Exception as e:
+            print(f"   -> [WARNING] Failed to write local file {filepath}: {e}")
 
     return {
-        "current_code": new_code,
+        "current_files": current_files,
         "iteration_count": current_count + 1,
         "ast_is_valid": True,
         # Fix #1: Wipe short-term critique memory HERE, AFTER the Dev Agent has
@@ -572,7 +597,8 @@ def documentation_summarizer_node(state: AgentState):
     print("Doc Agent: Summarizing the journey and saving the report...")
 
     full_log = state.get("full_history", [])
-    final_code = state.get("current_code", "")
+    files_dict = state.get("current_files", {})
+    final_code = format_files_for_llm(files_dict)
     final_votes = state.get("domain_approvals", {})
     iteration_count = state.get("iteration_count", 0)
 

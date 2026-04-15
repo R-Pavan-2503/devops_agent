@@ -8,24 +8,31 @@ from graph.builder import app
 
 print("\n[START] Starting Simulated PR Review Pipeline...")
 
-TEST_FILE_PATH      = "test_files/login.go"
-TEST_FILE_TEST_PATH = "test_files/login_test.go"   # Companion unit test file
-REPO_NAME           = "backend_pandhi"
+import os
+
+MOCK_DIR = "test_apps/backend_login_go"
+REPO_NAME = "backend_pandhi"
+
+current_files = {}
 
 try:
-    with open(TEST_FILE_PATH, "r", encoding="utf-8") as f:
-        code_content = f.read()
+    for root, dirs, files in os.walk(MOCK_DIR):
+        for file in files:
+            if file.endswith(".go"):
+                filepath = os.path.join(root, file)
+                # Normalize path separators for dict keys
+                normalized_path = filepath.replace("\\", "/")
+                with open(filepath, "r", encoding="utf-8") as f:
+                    current_files[normalized_path] = f.read()
 except Exception as e:
-    print(f"Error reading {TEST_FILE_PATH}: {e}")
+    print(f"Error reading mock directory {MOCK_DIR}: {e}")
     sys.exit(1)
 
 # This initial state mimics what the webhook + Celery worker would pass in
 initial_state = {
     "pr_url": f"https://github.com/fake/{REPO_NAME}/pull/1",
-    # The production source code to be reviewed
-    "current_code": code_content,
-    # Path to companion unit tests — QA agent uses this to estimate coverage
-    "test_file_path": TEST_FILE_TEST_PATH,
+    # The production source code to be reviewed (multi-file)
+    "current_files": current_files,
     "iteration_count": 0,
     "ast_is_valid": True,
     # Tells the Architect agent which vector store repo to query

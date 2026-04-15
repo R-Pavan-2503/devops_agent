@@ -24,7 +24,7 @@ class AgentState(TypedDict):
     pr_url: str
     ado_ticket_id: str
     uac_context: str 
-    current_code: str
+    current_files: dict[str, str]
     repo_name: str          # The repo identifier used in vector store lookups
     
     # Smart Routing Flags
