@@ -34,8 +34,9 @@ load_dotenv()
 arch_llm = ChatOpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1",
-    model="openai/gpt-oss-120b",
-    max_tokens=3000
+    model="llama-3.3-70b-versatile",
+    max_tokens=3000,
+    temperature=0.0
 )
 
 # High-quality reviewer: complex backend logic analysis
@@ -43,7 +44,8 @@ review_llm_70b = ChatOpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1",
     model="llama-3.3-70b-versatile",
-    max_tokens=300
+    max_tokens=300,
+    temperature=0.0
 )
 
 # Fast reviewer: universal rule-based checks (security, quality, frontend)
@@ -52,7 +54,8 @@ review_llm_8b = ChatOpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1",
     model="llama-3.1-8b-instant",
-    max_tokens=300
+    max_tokens=300,
+    temperature=0.0
 )
 
 # QA Agent: separate token bucket from 70b model
@@ -60,7 +63,8 @@ review_llm_scout = ChatOpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1",
     model="meta-llama/llama-4-scout-17b-16e-instruct",
-    max_tokens=300
+    max_tokens=300,
+    temperature=0.0
 )
 
 # =============================================================================
@@ -75,6 +79,8 @@ class SpecialistReview:
 
 def invoke_strict(messages, llm_instance, max_retries=3):
     """Invokes the chosen LLM and parses the TOON format response."""
+    current_messages = list(messages)  # Copy so we don't mutate the caller's list
+    
     for attempt in range(max_retries):
         try:
             time.sleep(3)  # Prevent rate-limit bursting
@@ -83,7 +89,7 @@ def invoke_strict(messages, llm_instance, max_retries=3):
                 "vote: [APPROVE or REJECT]\n"
                 "critique: [your findings here, 1 string only, or empty if approved]"
             )
-            new_messages = messages + [HumanMessage(content=instructions)]
+            new_messages = current_messages + [HumanMessage(content=instructions)]
             res = llm_instance.invoke(new_messages)
 
             content = res.content.strip()
@@ -102,14 +108,8 @@ def invoke_strict(messages, llm_instance, max_retries=3):
                     else:
                         content = content_inner
 
-            # Fallback for single-word responses avoiding TOON format completely
-            if content.upper() in ["APPROVE", "APPROVED"]:
-                return SpecialistReview(vote="approved", critique="")
-            elif content.upper() in ["REJECT", "REJECTED"]:
-                return SpecialistReview(vote="rejected", critique="No explicit critique provided.")
-
             lines = content.split("\n")
-            vote = None
+            vote = "rejected"
             critique = ""
             for line in lines:
                 if line.lower().startswith("vote:"):
@@ -120,25 +120,18 @@ def invoke_strict(messages, llm_instance, max_retries=3):
                 elif line.strip() and not critique and not line.lower().startswith("vote:"):
                     critique += line.strip() + " "
 
-            if vote is None:
-                # If they skipped the vote: block, fallback to checking the whole content
-                if "approve" in content.lower():
-                    vote = "approved"
-                else:
-                    vote = "rejected"
-                    if not critique:
-                        critique = content.strip()
-                        
-            # Prevent edge cases where the LLM writes "Critique: REJECT"
-            if critique.upper() in ["APPROVE", "APPROVED", "REJECT", "REJECTED"]:
-                if critique.upper() in ["APPROVE", "APPROVED"]:
-                    vote = "approved"
-                    critique = ""
-                else:
-                    vote = "rejected"
-                    critique = "Code rejected. Rule violation."
+            critique = critique.strip()
 
-            return SpecialistReview(vote=vote, critique=critique.strip())
+            # Prevent 8b agent laziness: if it rejects, it MUST provide an actionable critique
+            if vote == "rejected" and (not critique or critique.lower() in ["reject", "rejected"]):
+                print(f"      (Attempt {attempt+1}) Agent rejected without providing a reason. Forcing retry...")
+                # Append the bad response and a strict warning to the history 
+                # so the 0.0 temperature LLM gets a different prompt next time!
+                current_messages.append(res)
+                current_messages.append(HumanMessage(content="You rejected the code but provided no explanation. You MUST provide a specific, actionable critique formatted as '[CATEGORY] file:line — finding'. Do not just say 'REJECT'. Try again."))
+                continue
+
+            return SpecialistReview(vote=vote, critique=critique)
 
         except Exception as e:
             if attempt == max_retries - 1:
@@ -314,14 +307,39 @@ def backend_analyst_node(state: AgentState):
         leak patterns, incorrect HTTP status codes, error handling.
         These are universal backend patterns — no codebase comparison needed.
         Uses the 70b model for its superior reasoning on complex logic.
+
+    Fix #2 — UAC Injection:
+        If a uac_context is present in state (from the PR description or Jira
+        ticket), it is prepended to the code review prompt. This lets the
+        analyst verify that the code actually implements the right feature,
+        not just that it is syntactically correct.
     """
     time.sleep(2)
+    repo_name = state.get("repo_name", "").lower()
+    
+    # CROSS-DISCIPLINE REVIEW: 
+    # Backend devs already wrote backend code, so the Backend Agent shouldn't review it.
+    if "backend" in repo_name:
+        print(" Backend Analyst: Skipping backend repo (Cross-discipline review paradigm).")
+        return {
+            "domain_approvals": {"backend": "approved"},
+            "active_critiques": []
+        }
+        
     print(" Backend Analyst: Checking functional logic and efficiency...")
 
     code = state.get("current_code", "")
+    uac_context = state.get("uac_context", "").strip()
+
+    uac_block = (
+        f"User Acceptance Criteria (UAC):\n{uac_context}\n\n"
+        "Verify that the code below implements exactly what the UAC describes.\n"
+        "A feature mismatch is a CRITICAL logic flaw — REJECT immediately.\n\n"
+    ) if uac_context else ""
+
     messages = [
         SystemMessage(content=BACKEND_ANALYST_AGENT_PROMPT),
-        HumanMessage(content=code)
+        HumanMessage(content=f"{uac_block}Review this code for functional logic issues:\n\n{code}")
     ]
     ai_review = invoke_strict(messages, review_llm_70b)
 
@@ -365,51 +383,34 @@ def code_quality_agent_node(state: AgentState):
 
 def qa_agent_node(state: AgentState):
     """
-    QA / SDET Agent — Test Coverage & Testability Checker.
-
-    Coverage Gate (70–80% sweet spot):
-        Reads both the production source code (current_code) and the
-        companion unit-test file (test_file_path from state).
-        REJECTS if estimated branch coverage < 70% (insufficient) or
-        > 80% (gold-plating). APPROVES only within the 70–80% range.
+    QA / SDET Agent — Testability Checker.
 
     Why NO ChromaDB:
-        Coverage estimation is performed purely against the two supplied
-        files — no existing-codebase comparison is needed.
-        Uses Llama-4-Scout for a separate 500K TPD token bucket.
+        Checks if the NEW code is testable: dependency injection used?
+        Are interfaces abstracted? Is there input validation? These are
+        universal testability patterns checked against the PR code alone.
+        Uses Llama-4-Scout which has a separate 500K TPD bucket.
+
+    Fix #2 — UAC Injection:
+        If a uac_context is provided, the QA agent is also asked to verify
+        that existing tests explicitly cover the acceptance scenarios defined
+        in the UAC — not just generic branch coverage.
     """
     time.sleep(2)
-    print(" QA Agent: Checking test coverage (70-80% gate) and testability...")
+    print(" QA Agent: Checking testability and mocks...")
 
-    source_code = state.get("current_code", "")
+    code = state.get("current_code", "")
+    uac_context = state.get("uac_context", "").strip()
 
-    # ---------------------------------------------------------------
-    # Load the companion test file so the LLM can count covered
-    # branches and estimate actual coverage percentage.
-    # ---------------------------------------------------------------
-    test_file_path = state.get("test_file_path", "")
-    test_code = ""
-    if test_file_path:
-        try:
-            with open(test_file_path, "r", encoding="utf-8") as f:
-                test_code = f.read()
-            print(f"   [QA] Loaded test file: {test_file_path}")
-        except FileNotFoundError:
-            print(f"   [QA] WARNING: test file not found at '{test_file_path}'. Coverage check degraded.")
-        except Exception as e:
-            print(f"   [QA] WARNING: could not read test file: {e}")
-    else:
-        print("   [QA] No test_file_path in state — coverage check limited to testability only.")
-
-    # Build a two-block human message so the LLM sees source vs tests clearly
-    human_content = (
-        f"SOURCE CODE:\n```\n{source_code}\n```\n\n"
-        f"TEST CODE:\n```\n{test_code if test_code else '(no test file provided)'}\n```"
-    )
+    uac_block = (
+        f"User Acceptance Criteria (UAC):\n{uac_context}\n\n"
+        "Also verify that the test suite contains at least one test case \n"
+        "that validates each UAC scenario above. Missing UAC coverage = REJECT.\n\n"
+    ) if uac_context else ""
 
     messages = [
         SystemMessage(content=QA_AGENT_PROMPT),
-        HumanMessage(content=human_content)
+        HumanMessage(content=f"{uac_block}{code}")
     ]
     ai_review = invoke_strict(messages, review_llm_scout)
 
@@ -435,6 +436,17 @@ def frontend_agent_node(state: AgentState):
         Uses the fast 8b model for quick verdict.
     """
     time.sleep(2)
+    repo_name = state.get("repo_name", "").lower()
+    
+    # CROSS-DISCIPLINE REVIEW: 
+    # Frontend devs already wrote frontend code, so the Frontend Agent shouldn't review it.
+    if "frontend" in repo_name:
+        print(" Frontend Agent: Skipping frontend repo (Cross-discipline review paradigm).")
+        return {
+            "domain_approvals": {"frontend": "approved"},
+            "active_critiques": []
+        }
+
     print(" Frontend Agent: Checking API contract and formatting...")
 
     code = state.get("current_code", "")
@@ -474,9 +486,7 @@ def development_agent_node(state: AgentState):
         f"Feedback from all reviewers:\n{chr(10).join(critique_log)}\n\n"
         f"{warning_text}"
         f"Please fix this code:\n\n{broken_code}\n\n"
-        "CRITICAL: Output ONLY the raw source code as plain text. "
-        "Do NOT use any tool calls, function calls, or JSON wrappers. "
-        "Your entire response must be executable source code and nothing else."
+        "CRITICAL: First provide your CHECKLIST, then provide the full rewritten source code enclosed in triple backticks. Do not use any tool calls or wrappers."
     )
     messages = [
         SystemMessage(content=DEV_AGENT_PROMPT),
@@ -487,24 +497,36 @@ def development_agent_node(state: AgentState):
     response = invoke_with_retry(arch_llm, messages)
 
     new_code = response.content
+    checklist = ""
 
-    # Strip markdown fences if the LLM wrapped code in ```
+    # Parse checklist and code. The code must be inside triple backticks.
     if "```" in new_code:
         parts = new_code.split("```")
         if len(parts) >= 3:
+            checklist = parts[0].strip()
             content = parts[1]
+            # Remove language identifier like 'python' or 'go'
             lines = content.split("\n")
-            if lines and not lines[0].strip().startswith(" "):
+            if lines and not lines[0].strip().startswith(" ") and len(lines[0].strip().split()) == 1:
                 content = "\n".join(lines[1:])
             new_code = content.strip()
 
+    if checklist:
+        safe_checklist = checklist.encode("ascii", errors="replace").decode("ascii")
+        print(f"\n   -> Verification Checklist:\n{safe_checklist}\n")
+
     safe_code = new_code.encode("ascii", errors="replace").decode("ascii")
-    print(f"   -> Wrote new code:\n{safe_code}\n")
+    print(f"   -> Wrote new code:\n{safe_code[:200]}... [truncated for display]\n")
 
     return {
         "current_code": new_code,
         "iteration_count": current_count + 1,
         "ast_is_valid": True,
+        # Fix #1: Wipe short-term critique memory HERE, AFTER the Dev Agent has
+        # read and consumed it. consensus_node archives them to full_history
+        # first; we clear the short-term store so the next round of review
+        # agents start with a clean slate.
+        "active_critiques": [],
         "domain_approvals": {
             "backend": "pending",
             "security": "pending",
@@ -514,6 +536,28 @@ def development_agent_node(state: AgentState):
             "frontend": "pending"
         },
     }
+
+
+def _condense_history(full_log: list, max_entries: int = 12, max_chars_per_entry: int = 120) -> str:
+    """
+    Fix #4 — Doc Agent Token Bloat.
+
+    Produces a tight timeline string from the full critique history:
+      - Only keeps the last `max_entries` entries (default 12) to stay well
+        inside the 70b model's usable context window.
+      - Truncates any single entry that exceeds `max_chars_per_entry` chars
+        (e.g., large code snippets accidentally captured in a critique).
+
+    This replaces the raw `full_log[-18:]` slice that was passed verbatim,
+    which could exceed the context window on longer pipelines.
+    """
+    condensed = []
+    for entry in full_log[-max_entries:]:
+        if len(entry) > max_chars_per_entry:
+            condensed.append(entry[:max_chars_per_entry] + " […truncated]")
+        else:
+            condensed.append(entry)
+    return "\n".join(condensed) if condensed else "(no history recorded)"
 
 
 def documentation_summarizer_node(state: AgentState):
@@ -580,10 +624,20 @@ def documentation_summarizer_node(state: AgentState):
     # -----------------------------------------------------------------------
     # Compose the human message with all structured data blocks
     # -----------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Fix #4: Condense the history before building the human message.
+    # _condense_history() trims the log to max 12 entries, each capped at
+    # 120 chars, so the Doc Agent gets a tight timeline rather than a
+    # potentially massive blob of verbose critiques or code snippets.
+    # -----------------------------------------------------------------------
+    condensed_history = _condense_history(full_log)
+    requires_human_review = state.get("requires_human_review", False)
+
     human_content = (
         f"VERDICTS:\n{verdicts_table}\n\n"
         f"FINAL_CRITIQUES:\n{final_critiques_block}\n\n"
-        f"HISTORY (summarized critique log):\n{chr(10).join(full_log[-18:])}\n\n"  # Last 18 entries max
+        f"HISTORY (condensed timeline):\n{condensed_history}\n\n"
+        f"REQUIRES_HUMAN_REVIEW: {requires_human_review}\n\n"
         f"FINAL_CODE:\n{final_code}"
     )
 

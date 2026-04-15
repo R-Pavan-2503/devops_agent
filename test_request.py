@@ -10,7 +10,7 @@ print("\n[START] Starting Simulated PR Review Pipeline...")
 
 TEST_FILE_PATH      = "test_files/login.go"
 TEST_FILE_TEST_PATH = "test_files/login_test.go"   # Companion unit test file
-REPO_NAME           = "frontend_pandhi"
+REPO_NAME           = "backend_pandhi"
 
 try:
     with open(TEST_FILE_PATH, "r", encoding="utf-8") as f:

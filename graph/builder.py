@@ -22,19 +22,49 @@ def environment_sandbox_node(state: AgentState):
 
 
 # -----------------------------
+# Human Fallback Node (Fix #3)
+# -----------------------------
+def human_fallback_node(state: AgentState):
+    """
+    Reached when the pipeline exhausts all 3 review iterations without
+    reaching consensus. Stamps `requires_human_review: True` in state so
+    that the webhook response / front-end dashboard can tag a Senior
+    Developer to step in. Then falls through to the Doc Agent which will
+    include the failure sign-off in its Markdown report.
+    """
+    print(" [FALLBACK] Iteration limit reached. Escalating to human reviewer.")
+    print("   -> Setting requires_human_review = True in pipeline state.")
+    return {"requires_human_review": True}
+
+
+# -----------------------------
 #  NEW: Consensus Node (FAN-IN)
 # -----------------------------
 def consensus_node(state: AgentState):
+    """
+    Fan-in point — collects all specialist votes.
+
+    Fix #1 — Memory Wipe Bug:
+        active_critiques are NO LONGER wiped here. The Developer Agent is
+        the consumer of these critiques; it must read them BEFORE they are
+        cleared. Wiping here caused the Dev Agent to receive an empty log
+        on Round 2, creating an infinite failure loop.
+
+        The wipe now happens inside development_agent_node, after it copies
+        the critiques into the human message. full_history is still
+        accumulated here so the Doc Agent has the complete journey.
+    """
     votes = state.get("domain_approvals", {})
     print(f" Consensus Node: All agents finished.")
     print(f" Votes: {votes}")
 
     if any(vote == "rejected" for vote in votes.values()):
         current_critiques = state.get("active_critiques", [])
-        print(f" → {len(current_critiques)} critiques moving to long-term history. Wiping short-term.")
+        print(f" → {len(current_critiques)} critiques archived to full_history. Preserved for Dev Agent.")
         return {
-            "full_history": current_critiques,  # Appends to long-term memory
-            "active_critiques": [],             # WIPES short-term for next round
+            "full_history": current_critiques,  # Append to long-term memory
+            # ✅ active_critiques NOT wiped here — Dev Agent reads them first,
+            #    then wipes them in its own return dict.
         }
     return {}
 
@@ -58,6 +88,7 @@ workflow.add_node("frontend_agent_node", frontend_agent_node)
 
 workflow.add_node("consensus_node", consensus_node)
 
+workflow.add_node("human_fallback_node", human_fallback_node)
 workflow.add_node("documentation_summarizer_node", documentation_summarizer_node)
 workflow.add_node("environment_sandbox_node", environment_sandbox_node)
 
@@ -89,6 +120,7 @@ workflow.add_edge("frontend_agent_node", "consensus_node")
 # -----------------------------
 # Final Flow
 # -----------------------------
+workflow.add_edge("human_fallback_node", "documentation_summarizer_node")
 workflow.add_edge("environment_sandbox_node", "documentation_summarizer_node")
 workflow.add_edge("documentation_summarizer_node", END)
 

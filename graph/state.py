@@ -23,10 +23,9 @@ class AgentState(TypedDict):
     # Ingestion Inputs
     pr_url: str
     ado_ticket_id: str
-    uac_context: str
+    uac_context: str 
     current_code: str
     repo_name: str          # The repo identifier used in vector store lookups
-    test_file_path: str     # Path to the companion unit test file (e.g. login_test.go)
     
     # Smart Routing Flags
     pr_type: str 
@@ -48,6 +47,9 @@ class AgentState(TypedDict):
     iteration_count: int
     requires_summarization: bool 
     tie_breaker_invoked: bool
+    # Set to True when the iteration limit (3 rounds) is hit without consensus.
+    # Signals the dashboard/webhook consumer to escalate to a human reviewer.
+    requires_human_review: bool
 
     # Codebase context cache: Architecture Agent fetches this ONCE in Round 1.
     # Subsequent rounds reuse it without re-querying ChromaDB.
