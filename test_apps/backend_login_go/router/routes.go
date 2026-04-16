@@ -3,6 +3,7 @@ package router
 import (
 	"net/http"
 	"backend_login_go/api"
+	"backend_login_go/service"
 )
 
 type Route struct {
@@ -10,10 +11,10 @@ type Route struct {
 	Handler http.HandlerFunc
 }
 
-func RegisterRoutes() *http.ServeMux {
+func RegisterRoutes(authService service.AuthService) *http.ServeMux {
 	mux := http.NewServeMux()
 	routes := []Route{
-		{Path: "/api/login", Handler: api.LoginEndpoint},
+		{Path: "/api/login", Handler: api.LoginEndpoint(authService)},
 		{Path: "/api/profile", Handler: api.ProfileEndpoint},
 	}
 

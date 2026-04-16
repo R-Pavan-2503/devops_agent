@@ -54,5 +54,13 @@ print(f"[TEST] Simulating an incoming pull request for repository: {initial_stat
 for output in app.stream(initial_state):
     for node_name, result in output.items():
         print(f"\n[OK] {node_name} Finished Processing.")
+
+        print("---------------------------------------------------------------------")
+        print()
+        print(result)
+        print()
+        print("***********************************************************************")
+        print()
+        print()
         
 print("\n[DONE] Full testing simulation complete!")

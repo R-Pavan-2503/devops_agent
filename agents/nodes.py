@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -10,6 +11,12 @@ from agents.prompts import (
     FRONTEND_AGENT_PROMPT
 )
 from agents.tools import search_codebase_context
+from agents.sandbox import (
+    setup_workspace,
+    update_workspace_files,
+    run_tests_in_docker,
+    teardown_workspace,
+)
 
 load_dotenv()
 
@@ -476,11 +483,41 @@ def frontend_agent_node(state: AgentState):
 
 def development_agent_node(state: AgentState):
     """
-    Developer Agent — Code Rewriter.
+    Developer Agent — Code Rewriter + Docker Sandbox Validator.
 
     Receives the combined critique log from all agents in the current round
     and rewrites the code to fix all identified issues. Uses the 70b model
     for high-quality code generation.
+
+    Sandbox Integration (3-round loop):
+        Round 1 (iteration_count == 0):
+            - setup_workspace() creates the host temp dir and writes all .go files.
+            - A minimal go.mod (module backend_login_go) is auto-injected so
+              `go vet` works inside Docker without needing network access.
+            - LLM rewrites the code based on agent critiques alone (no prior
+              Docker result yet on Round 1).
+            - update_workspace_files() patches the sandbox with the new code.
+            - run_tests_in_docker() runs `go vet` on business packages.
+            - Result stored in state['sandbox_test_result'] for Round 2.
+
+        Rounds 2 & 3 (iteration_count >= 1):
+            - Workspace already exists (path carried in state).
+            - LLM receives the PREVIOUS round's `go vet` output as hard
+              compiler evidence in addition to agent critiques.
+            - update_workspace_files() patches workspace with LLM's new code.
+            - run_tests_in_docker() verifies the new fix.
+
+    Note on test command:
+        We run `go vet` on business-logic packages only (api, controller,
+        service, utils, repository, router). The `tests/` package is excluded
+        because it imports external dependencies (github.com/lib/pq,
+        github.com/stretchr/testify) that cannot be downloaded when
+        network_disabled=True is enforced on the container.
+
+    Teardown:
+        documentation_summarizer_node calls teardown_workspace() exactly once
+        after the loop ends (both the happy-path and human-fallback paths
+        converge there).
     """
     time.sleep(2)
     print("Development Agent: Rewriting the code to fix issues...")
@@ -488,14 +525,44 @@ def development_agent_node(state: AgentState):
     broken_code = format_files_for_llm(state.get("current_files", {}))
     current_count = state.get("iteration_count", 0)
     critique_log = state.get("active_critiques", [])
+    workspace_path = state.get("sandbox_workspace_path", "")
+    prev_docker_result = state.get("sandbox_test_result", "")
+
+    # ── Sandbox: Setup on Round 1, patch-in-place on Rounds 2 & 3 ────────
+    current_files = dict(state.get("current_files", {}))
+
+    if not workspace_path:
+        # Round 1 — First time: create the temp workspace and inject go.mod.
+        # The go.mod module name MUST match the import prefix used in the
+        # Go files (e.g. "backend_login_go/service").
+        files_for_sandbox = dict(current_files)
+        if any(f.endswith(".go") for f in files_for_sandbox):
+            files_for_sandbox["go.mod"] = "module backend_login_go\n\ngo 1.22\n"
+        workspace_path = setup_workspace(files_for_sandbox)
+        print(f"   [Sandbox] Workspace created: {workspace_path}")
+    else:
+        # Rounds 2 & 3 — Reuse the existing workspace, patch changed files.
+        update_workspace_files(workspace_path, current_files)
+        print(f"   [Sandbox] Workspace patched for Round {current_count + 1}: {workspace_path}")
+
+    # ── Build LLM prompt with Docker compiler evidence (if available) ─────
+    # Round 1 has no prior Docker result yet — that's fine, agent critiques
+    # are sufficient for the first fix attempt.
+    docker_evidence_block = (
+        f"Docker Sandbox result from previous fix attempt:\n{prev_docker_result}\n\n"
+    ) if prev_docker_result else ""
 
     warning_text = "WARNING: FINAL ATTEMPT. Fix ALL critiques or build fails.\n\n" if current_count == 2 else ""
 
     human_content = (
         f"Feedback from all reviewers:\n{chr(10).join(critique_log)}\n\n"
+        f"{docker_evidence_block}"
         f"{warning_text}"
         f"Please fix this codebase:\n\n{broken_code}\n\n"
-        "CRITICAL: First provide your CHECKLIST, then provide the full rewritten source code enclosed in triple backticks for each file you modify. DO NOT wrap the entire response in a single block, but use [FILE: path] followed by a backtick block for EACH file. Do not use any tool calls or wrappers."
+        "CRITICAL: First provide your CHECKLIST, then provide the full rewritten "
+        "source code enclosed in triple backticks for each file you modify. "
+        "DO NOT wrap the entire response in a single block — use [FILE: path] "
+        "followed by a backtick block for EACH file. Do not use tool calls or wrappers."
     )
     messages = [
         SystemMessage(content=DEV_AGENT_PROMPT),
@@ -507,46 +574,93 @@ def development_agent_node(state: AgentState):
 
     new_code = response.content
     checklist = ""
-    
-    # Parse multi-file output: Look for [FILE: path] and ``` blocks
-    import re
-    # We first extract checklist - anything before the first [FILE:
+
+    # Parse multi-file output: extract checklist + per-file blocks
     parts = new_code.split("[FILE:", 1)
     if len(parts) > 1:
         checklist = parts[0].strip()
         file_content_part = "[FILE:" + parts[1]
     else:
         file_content_part = new_code
-    
+
     if checklist:
         safe_checklist = checklist.encode("ascii", errors="replace").decode("ascii")
         print(f"\n   -> Verification Checklist:\n{safe_checklist}\n")
 
-    current_files = state.get("current_files", {})
-    file_blocks = re.findall(r"\[FILE:\s*(.*?)\s*\]\n*(?:```[\w]*\n)?(.*?)```", file_content_part, re.DOTALL)
-    
+    file_blocks = re.findall(
+        r"\[FILE:\s*(.*?)\s*\]\n*(?:```[\w]*\n)?(.*?)```",
+        file_content_part,
+        re.DOTALL
+    )
+
     for filepath, file_content in file_blocks:
         filepath = filepath.strip()
-        # Remove trailing/leading newlines from code if any
         file_content = file_content.strip()
-        
-        # Write to state dict
         current_files[filepath] = file_content
-        
-        # Physical write to disk
+
+        # Physical write to local disk (for dev inspection between rounds)
         try:
-            # Create directories if they don't exist
-            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            parent = os.path.dirname(filepath)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(file_content)
             print(f"   -> Overwrote local file: {filepath}")
         except Exception as e:
             print(f"   -> [WARNING] Failed to write local file {filepath}: {e}")
 
+    # ── Patch sandbox workspace with LLM's rewritten files ───────────────
+    # Exclude go.mod — it was injected once at setup and must never be
+    # overwritten by LLM output (the LLM doesn't know the module name).
+    files_to_patch = {k: v for k, v in current_files.items() if k != "go.mod"}
+    update_workspace_files(workspace_path, files_to_patch)
+    print(f"   [Sandbox] Patched {len(files_to_patch)} file(s) with LLM's rewritten code.")
+
+    # ── Run Docker compilation check (`go vet`) ───────────────────────────
+    # Only vet business-logic packages. `tests/` is excluded because it
+    # imports third-party libs (testify, lib/pq) unavailable without network.
+    docker_result = run_tests_in_docker(
+        workspace_path=workspace_path,
+        test_command=(
+            "cd test_apps/backend_login_go && "
+            "go vet "
+            "./api/... "
+            "./controller/... "
+            "./service/... "
+            "./utils/... "
+            "./repository/... "
+            "./router/... "
+            "2>&1"
+        ),
+        docker_image="golang:1.22-alpine",
+    )
+
+    if docker_result.passed:
+        sandbox_result_str = (
+            f"[SANDBOX Round {current_count + 1}] ✅ go vet PASSED "
+            "\u2014 all business-logic packages compile cleanly."
+        )
+        print(f"   [Sandbox] ✅ go vet PASSED")
+    elif docker_result.timed_out:
+        sandbox_result_str = (
+            f"[SANDBOX Round {current_count + 1}] ⏱️ go vet TIMED OUT after 60s."
+        )
+        print(f"   [Sandbox] ⏱️ TIMED OUT")
+    else:
+        sandbox_result_str = (
+            f"[SANDBOX Round {current_count + 1}] ❌ go vet FAILED "
+            f"(exit_code={docker_result.exit_code}).\n"
+            f"STDOUT:\n{docker_result.stdout[:1500]}\n"
+            f"STDERR:\n{docker_result.stderr[:1500]}"
+        )
+        print(f"   [Sandbox] ❌ go vet FAILED (exit={docker_result.exit_code})")
+
     return {
         "current_files": current_files,
         "iteration_count": current_count + 1,
         "ast_is_valid": True,
+        "sandbox_workspace_path": workspace_path,
+        "sandbox_test_result": sandbox_result_str,
         # Fix #1: Wipe short-term critique memory HERE, AFTER the Dev Agent has
         # read and consumed it. consensus_node archives them to full_history
         # first; we clear the short-term store so the next round of review
@@ -592,8 +706,26 @@ def documentation_summarizer_node(state: AgentState):
     Reads structured verdicts and critiques from state and passes them
     as pre-built data blocks so the LLM copies them verbatim instead of
     guessing from raw log text. This eliminates hallucinated verdicts.
+
+    Sandbox Teardown:
+        This node is the single convergence point for BOTH the happy-path
+        (environment_sandbox_node → here) and the failure-path
+        (human_fallback_node → here). Tearing down the Docker workspace here
+        guarantees it is called exactly once, regardless of which path was
+        taken, leaving zero footprint on the host machine.
     """
     time.sleep(2)
+
+    # ── Sandbox Teardown (called exactly once, after the 3-round loop) ────
+    workspace_path = state.get("sandbox_workspace_path", "")
+    if workspace_path:
+        try:
+            teardown_workspace(workspace_path)
+            print("   [Sandbox] Workspace torn down ✓ — host filesystem clean.")
+        except Exception as e:
+            # Non-fatal: log and continue. The report must still be generated.
+            print(f"   [Sandbox] Teardown warning (non-fatal): {e}")
+
     print("Doc Agent: Summarizing the journey and saving the report...")
 
     full_log = state.get("full_history", [])

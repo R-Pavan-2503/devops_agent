@@ -5,18 +5,25 @@ import (
 	"database/sql"
 )
 
-type UserRepository struct {
+type UserRepository interface {
+	GetUser(username string) (*model.User, error)
+}
+
+type userRepositoryImpl struct {
 	db *sql.DB
 }
 
-func NewUserRepository(db *sql.DB) *UserRepository {
-	return &UserRepository{db: db}
+func NewUserRepository(db *sql.DB) UserRepository {
+	return &userRepositoryImpl{db: db}
 }
 
-func (u *UserRepository) GetUser(username string) (*model.User, error) {
+func (u *userRepositoryImpl) GetUser(username string) (*model.User, error) {
 	var user model.User
 	err := u.db.QueryRow("SELECT id, username, status, password FROM users WHERE username = $1", username).Scan(&user.ID, &user.Username, &user.Status, &user.Password)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
 		return nil, err
 	}
 	return &user, nil

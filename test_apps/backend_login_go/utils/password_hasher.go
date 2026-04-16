@@ -19,5 +19,8 @@ func (p *PasswordHasher) HashPassword(password string) (string, error) {
 }
 
 func (p *PasswordHasher) CompareHashAndPassword(hashedPassword string, password string) error {
+	if hashedPassword == "" {
+		return bcrypt.ErrHashTooShort
+	}
 	return bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password))
 }
