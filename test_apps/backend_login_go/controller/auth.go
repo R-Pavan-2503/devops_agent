@@ -6,9 +6,10 @@ import (
 	"backend_login_go/repository"
 	"backend_login_go/utils"
 	"backend_login_go/validation"
+	"strings"
 )
 
-type Creds struct {
+type Credentials struct {
 	Username string
 	Password string
 }
@@ -21,7 +22,7 @@ type User struct {
 }
 
 type AuthController interface {
-	Authenticate(c Creds) (*User, error)
+	Authenticate(credentials Credentials) (*User, error)
 }
 
 type UserRepositoryInterface interface {
@@ -30,6 +31,7 @@ type UserRepositoryInterface interface {
 
 type PasswordHasherInterface interface {
 	CompareHashAndPassword(hashedPassword string, password string) error
+	HashPassword(password string) (string, error)
 }
 
 type ErrorHandlerInterface interface {
@@ -46,15 +48,18 @@ func NewAuthController(userRepository UserRepositoryInterface, passwordHasher Pa
 	return &authControllerImpl{userRepository: userRepository, passwordHasher: passwordHasher, errorHandler: errorHandler}
 }
 
-func (a *authControllerImpl) Authenticate(c Creds) (*User, error) {
-	if err := validation.ValidateUsername(c.Username); err != nil {
+func (a *authControllerImpl) Authenticate(credentials Credentials) (*User, error) {
+	if credentials.Username == "" || credentials.Password == "" {
+		return nil, a.errorHandler.HandleError("username and password are required", http.StatusBadRequest)
+	}
+	if err := validation.ValidateUsername(credentials.Username); err != nil {
 		return nil, a.errorHandler.HandleError(err.Error(), http.StatusBadRequest)
 	}
-	if err := validation.ValidatePassword(c.Password); err != nil {
+	if err := validation.ValidatePassword(credentials.Password); err != nil {
 		return nil, a.errorHandler.HandleError(err.Error(), http.StatusBadRequest)
 	}
 
-	user, err := a.userRepository.GetUser(c.Username)
+	user, err := a.getUser(credentials.Username)
 	if err != nil {
 		return nil, a.errorHandler.HandleError("internal server error", http.StatusInternalServerError)
 	}
@@ -63,12 +68,7 @@ func (a *authControllerImpl) Authenticate(c Creds) (*User, error) {
 		return nil, a.errorHandler.HandleError("unauthorized", http.StatusUnauthorized)
 	}
 
-	if user.Username == "" || user.Password == "" {
-		return nil, a.errorHandler.HandleError("malformed user object", http.StatusInternalServerError)
-	}
-
-	err = a.passwordHasher.CompareHashAndPassword(user.Password, c.Password)
-	if err != nil {
+	if err := a.passwordHasher.CompareHashAndPassword(user.Password, credentials.Password); err != nil {
 		return nil, a.errorHandler.HandleError("unauthorized", http.StatusUnauthorized)
 	}
 
@@ -78,6 +78,10 @@ func (a *authControllerImpl) Authenticate(c Creds) (*User, error) {
 		Status:   user.Status,
 		Password: user.Password,
 	}, nil
+}
+
+func (a *authControllerImpl) getUser(username string) (*model.User, error) {
+	return a.userRepository.GetUser(username)
 }
 
 type errorHandlerImpl struct{}

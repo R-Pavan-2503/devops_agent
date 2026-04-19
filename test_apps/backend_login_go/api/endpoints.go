@@ -15,22 +15,63 @@ type LoginResponse struct {
 	Status    string    `json:"status"`
 	CreatedAt time.Time `json:"created_at"`
 	ErrorMessage string `json:"error_message"`
+	ErrorCode   int      `json:"error_code"`
 }
 
 type ResponseWriter interface {
 	http.ResponseWriter
 }
 
-func decodeRequestBody(r *http.Request) (service.Creds, error) {
-	var creds service.Creds
-	err := json.NewDecoder(r.Body).Decode(&creds)
+func decodeRequestBody(r *http.Request) (service.Credentials, error) {
+	var credentials service.Credentials
+	err := json.NewDecoder(r.Body).Decode(&credentials)
 	if err != nil {
-		return creds, err
+		return credentials, validation.NewValidationError("invalid json request")
 	}
-	if creds.Username == "" || creds.Password == "" {
-		return creds, errors.New("username and password are required")
+	if credentials.Username == "" || credentials.Password == "" {
+		return credentials, validation.NewValidationError("username and password are required")
 	}
-	return creds, nil
+	return credentials, nil
+}
+
+func validateRequestBody(credentials service.Credentials) error {
+	if err := validateUsername(credentials.Username); err != nil {
+		return err
+	}
+	if err := validatePassword(credentials.Password); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateUsername(username string) error {
+	if username == "" {
+		return validation.NewValidationError("username is required")
+	}
+	if len(username) < 3 || len(username) > 20 {
+		return validation.NewValidationError("username must be between 3 and 20 characters")
+	}
+	if containsInvalidChars(username) {
+		return validation.NewValidationError("username contains invalid characters")
+	}
+	return nil
+}
+
+func validatePassword(password string) error {
+	if password == "" {
+		return validation.NewValidationError("password is required")
+	}
+	if len(password) < 8 {
+		return validation.NewValidationError("password must be at least 8 characters")
+	}
+	if containsInvalidChars(password) {
+		return validation.NewValidationError("password contains invalid characters")
+	}
+	return nil
+}
+
+func containsInvalidChars(input string) bool {
+	return strings.Contains(input, ";") || strings.Contains(input, "--")
 }
 
 func createLoginResponse(user *service.User) LoginResponse {
@@ -42,15 +83,16 @@ func createLoginResponse(user *service.User) LoginResponse {
 	}
 }
 
-func createLoginErrorResponse(err error) LoginResponse {
+func createLoginErrorResponse(err error, code int) LoginResponse {
 	return LoginResponse{
 		ErrorMessage: err.Error(),
+		ErrorCode:     code,
 	}
 }
 
 type ResponseHandler interface {
 	HandleResponse(w ResponseWriter, user *service.User)
-	HandleError(w ResponseWriter, err error)
+	HandleError(w ResponseWriter, err error, code int)
 }
 
 type responseHandlerImpl struct{}
@@ -64,36 +106,36 @@ func (r *responseHandlerImpl) HandleResponse(w ResponseWriter, user *service.Use
 	json.NewEncoder(w).Encode(loginResponse)
 }
 
-func (r *responseHandlerImpl) HandleError(w ResponseWriter, err error) {
-	loginResponse := createLoginErrorResponse(err)
+func (r *responseHandlerImpl) HandleError(w ResponseWriter, err error, code int) {
+	loginResponse := createLoginErrorResponse(err, code)
 	json.NewEncoder(w).Encode(loginResponse)
 }
 
 type AuthServiceInterface interface {
-	Authenticate(creds service.Creds) (*service.User, error)
+	Authenticate(credentials service.Credentials) (*service.User, error)
 }
 
 func LoginEndpoint(authService AuthServiceInterface, responseHandler ResponseHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		creds, err := decodeRequestBody(r)
+		if r.Method != "POST" {
+			http.Error(w, "invalid request method", http.StatusBadRequest)
+			return
+		}
+
+		credentials, err := decodeRequestBody(r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		if err := validation.ValidateUsername(creds.Username); err != nil {
+		if err := validateRequestBody(credentials); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		if err := validation.ValidatePassword(creds.Password); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		user, err := authService.Authenticate(creds)
+		user, err := authService.Authenticate(credentials)
 		if err != nil {
-			responseHandler.HandleError(w, err)
+			responseHandler.HandleError(w, err, http.StatusUnauthorized)
 			return
 		}
 

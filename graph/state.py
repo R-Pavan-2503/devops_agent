@@ -69,3 +69,11 @@ class AgentState(TypedDict):
     # Subsequent rounds reuse it without re-querying ChromaDB.
     # reducer: only update when a non-empty value is returned (preserve_if_set)
     arch_codebase_context: Annotated[str, preserve_if_set]
+
+    # Sandbox workspace path — persisted across rounds so the same temp dir is
+    # reused (patch-in-place) instead of creating a new workspace each iteration.
+    # preserve_if_set ensures a non-empty path is never overwritten with "".
+    sandbox_workspace_path: Annotated[str, preserve_if_set]
+
+    # Holds the stdout/stderr from the Docker compilation check to feed back into the Dev Agent
+    sandbox_test_result: str

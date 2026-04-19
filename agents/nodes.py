@@ -502,38 +502,26 @@ def development_agent_node(state: AgentState):
     Developer Agent — Code Rewriter + Docker Sandbox Validator.
 
     Receives the combined critique log from all agents in the current round
-    and rewrites the code to fix all identified issues. Uses the 70b model
-    for high-quality code generation.
+    and rewrites the code to fix all identified issues.
 
     Sandbox Integration (3-round loop):
         Round 1 (iteration_count == 0):
             - setup_workspace() creates the host temp dir and writes all .go files.
-            - A minimal go.mod (module backend_login_go) is auto-injected so
-              `go vet` works inside Docker without needing network access.
-            - LLM rewrites the code based on agent critiques alone (no prior
-              Docker result yet on Round 1).
-            - update_workspace_files() patches the sandbox with the new code.
-            - run_tests_in_docker() runs `go vet` on business packages.
-            - Result stored in state['sandbox_test_result'] for Round 2.
+            - go.mod is auto-injected at the Go project root (detected from file paths)
+              so `go vet` works inside Docker without needing network access.
+            - workspace_path is persisted in state so Rounds 2 & 3 can reuse it.
 
         Rounds 2 & 3 (iteration_count >= 1):
-            - Workspace already exists (path carried in state).
-            - LLM receives the PREVIOUS round's `go vet` output as hard
-              compiler evidence in addition to agent critiques.
-            - update_workspace_files() patches workspace with LLM's new code.
+            - Workspace already exists (path carried in state['sandbox_workspace_path']).
+            - update_workspace_files() patches the sandbox with the new code.
             - run_tests_in_docker() verifies the new fix.
 
-    Note on test command:
-        We run `go vet` on business-logic packages only (api, controller,
-        service, utils, repository, router). The `tests/` package is excluded
-        because it imports external dependencies (github.com/lib/pq,
-        github.com/stretchr/testify) that cannot be downloaded when
-        network_disabled=True is enforced on the container.
-
-    Teardown:
-        documentation_summarizer_node calls teardown_workspace() exactly once
-        after the loop ends (both the happy-path and human-fallback paths
-        converge there).
+    go.mod placement:
+        go.mod must live in the same directory as the Go source files, not at the
+        workspace root. The function detects the project root from the file paths:
+          "test_apps/backend_login_go/api/endpoints.go"  →  go.mod at
+          "test_apps/backend_login_go/go.mod"
+        This ensures `import "backend_login_go/service"` resolves correctly inside Docker.
     """
     time.sleep(2)
     print("Development Agent: Rewriting the code to fix issues...")
@@ -548,22 +536,52 @@ def development_agent_node(state: AgentState):
     current_files = dict(state.get("current_files", {}))
 
     if not workspace_path:
-        # Round 1 — First time: create the temp workspace and inject go.mod.
-        # The go.mod module name MUST match the import prefix used in the
-        # Go files (e.g. "backend_login_go/service").
-        files_for_sandbox = dict(current_files)
+        # Strip "test_apps/backend_login_go/" prefix so the Go project
+        # lands at the workspace root — matching how go.mod declares the module.
+        _PREFIX = "test_apps/"
+        files_for_sandbox = {
+            (k[len(_PREFIX):] if k.replace("\\", "/").startswith(_PREFIX) else k): v
+            for k, v in current_files.items()
+        }
+
         if any(f.endswith(".go") for f in files_for_sandbox):
-            files_for_sandbox["go.mod"] = "module backend_login_go\n\ngo 1.22\n"
+            # Inject the real go.mod from disk (has correct require + go version)
+            try:
+                with open("test_apps/backend_login_go/go.mod", "r", encoding="utf-8") as _f:
+                    files_for_sandbox["backend_login_go/go.mod"] = _f.read()
+                print("   [Sandbox] Injected real go.mod from disk")
+            except FileNotFoundError:
+                files_for_sandbox["backend_login_go/go.mod"] = "module backend_login_go\n\ngo 1.22\n"
+                print("   [Sandbox] WARNING: go.mod not found on disk — using minimal fallback")
+
+            # Inject go.sum so external deps (golang.org/x/crypto) resolve offline
+            for _sum_candidate in [
+                "test_apps/backend_login_go/go.sum",
+                "go.sum",
+            ]:
+                try:
+                    with open(_sum_candidate, "r", encoding="utf-8") as _f:
+                        files_for_sandbox["backend_login_go/go.sum"] = _f.read()
+                    print(f"   [Sandbox] Injected go.sum from {_sum_candidate} ({len(files_for_sandbox['backend_login_go/go.sum'])} bytes)")
+                    break
+                except FileNotFoundError:
+                    continue
+            else:
+                print("   [Sandbox] WARNING: go.sum not found anywhere — external deps may fail")
+
         workspace_path = setup_workspace(files_for_sandbox)
         print(f"   [Sandbox] Workspace created: {workspace_path}")
     else:
         # Rounds 2 & 3 — Reuse the existing workspace, patch changed files.
-        update_workspace_files(workspace_path, current_files)
+        _PREFIX = "test_apps/"
+        files_stripped = {
+            (k[len(_PREFIX):] if k.replace("\\", "/").startswith(_PREFIX) else k): v
+            for k, v in current_files.items()
+        }
+        update_workspace_files(workspace_path, files_stripped)
         print(f"   [Sandbox] Workspace patched for Round {current_count + 1}: {workspace_path}")
 
     # ── Build LLM prompt with Docker compiler evidence (if available) ─────
-    # Round 1 has no prior Docker result yet — that's fine, agent critiques
-    # are sufficient for the first fix attempt.
     docker_evidence_block = (
         f"Docker Sandbox result from previous fix attempt:\n{prev_docker_result}\n\n"
     ) if prev_docker_result else ""
@@ -585,13 +603,12 @@ def development_agent_node(state: AgentState):
         HumanMessage(content=human_content)
     ]
 
-    time.sleep(8)  # Rate limit buffer: all review agents just ran
+    time.sleep(8)
     response = invoke_with_retry(arch_llm, messages)
 
     new_code = response.content
     checklist = ""
 
-    # Parse multi-file output: extract checklist + per-file blocks
     parts = new_code.split("[FILE:", 1)
     if len(parts) > 1:
         checklist = parts[0].strip()
@@ -612,9 +629,11 @@ def development_agent_node(state: AgentState):
     for filepath, file_content in file_blocks:
         filepath = filepath.strip()
         file_content = file_content.strip()
+        if not file_content:
+            print(f"   -> [WARNING] LLM returned empty content for {filepath} — skipping to preserve original")
+            continue
         current_files[filepath] = file_content
 
-        # Physical write to local disk (for dev inspection between rounds)
         try:
             parent = os.path.dirname(filepath)
             if parent:
@@ -626,60 +645,76 @@ def development_agent_node(state: AgentState):
             print(f"   -> [WARNING] Failed to write local file {filepath}: {e}")
 
     # ── Patch sandbox workspace with LLM's rewritten files ───────────────
-    # Exclude go.mod — it was injected once at setup and must never be
-    # overwritten by LLM output (the LLM doesn't know the module name).
-    files_to_patch = {k: v for k, v in current_files.items() if k != "go.mod"}
+    # Exclude go.mod (any path variant) — injected once at setup, must not be overwritten.
+    _PREFIX = "test_apps/"
+    files_to_patch = {
+        (k[len(_PREFIX):] if k.replace("\\", "/").startswith(_PREFIX) else k): v
+        for k, v in current_files.items()
+        if k not in ("go.mod", "go.sum")  # never let LLM overwrite these
+    }
     update_workspace_files(workspace_path, files_to_patch)
     print(f"   [Sandbox] Patched {len(files_to_patch)} file(s) with LLM's rewritten code.")
 
-    # ── Run Docker compilation check (`go vet`) ───────────────────────────
-    # Only vet business-logic packages. `tests/` is excluded because it
-    # imports third-party libs (testify, lib/pq) unavailable without network.
+    # ── Run Docker compilation check (`go vet` -> `go test`) ───────────────
     docker_result = run_tests_in_docker(
         workspace_path=workspace_path,
         test_command=(
-            "cd test_apps/backend_login_go && "
-            "go vet "
-            "./api/... "
-            "./controller/... "
-            "./service/... "
-            "./utils/... "
-            "./repository/... "
-            "./router/... "
-            "2>&1"
+             "cd backend_login_go && "
+             "(GONOSUMCHECK=* GOFLAGS=-mod=mod go vet ./... && "
+             "echo '--- VET_PASSED ---' && "
+             "GONOSUMCHECK=* GOFLAGS=-mod=mod go test ./... -v) 2>&1"
         ),
-        docker_image="golang:1.22-alpine",
+        docker_image="golang:1.22",
     )
 
-    if docker_result.passed:
-        sandbox_result_str = (
-            f"[SANDBOX Round {current_count + 1}] ✅ go vet PASSED "
-            "\u2014 all business-logic packages compile cleanly."
-        )
-        print(f"   [Sandbox] ✅ go vet PASSED")
-    elif docker_result.timed_out:
-        sandbox_result_str = (
-            f"[SANDBOX Round {current_count + 1}] ⏱️ go vet TIMED OUT after 60s."
-        )
+    stdout_str = docker_result.stdout or ""
+    stderr_str = docker_result.stderr or ""
+    full_output = stdout_str + "\n" + stderr_str
+
+    if docker_result.timed_out:
+        sandbox_result_str = f"[SANDBOX Round {current_count + 1}] ⏱️ go vet/test TIMED OUT after 60s."
         print(f"   [Sandbox] ⏱️ TIMED OUT")
     else:
-        sandbox_result_str = (
-            f"[SANDBOX Round {current_count + 1}] ❌ go vet FAILED "
-            f"(exit_code={docker_result.exit_code}).\n"
-            f"STDOUT:\n{docker_result.stdout[:1500]}\n"
-            f"STDERR:\n{docker_result.stderr[:1500]}"
-        )
-        print(f"   [Sandbox] ❌ go vet FAILED (exit={docker_result.exit_code})")
+        # Determine exactly what happened
+        vet_passed = "--- VET_PASSED ---" in full_output
+        has_tests = "no test files" not in full_output and "?   " not in full_output
+        tests_passed = vet_passed and docker_result.passed
+
+        print("\n   [Sandbox] --- Execution Report ---")
+        if vet_passed:
+            print("   ✅ Compilation / go vet: SUCCESS")
+            if tests_passed:
+                print("   ✅ Unit Tests: SUCCESS")
+                sandbox_result_str = f"[SANDBOX Round {current_count + 1}] ✅ COMPILATION PASSED. ✅ UNIT TESTS PASSED."
+            else:
+                if has_tests:
+                    print(f"   ❌ Unit Tests: FAILED (exit code {docker_result.exit_code})")
+                    sandbox_result_str = f"[SANDBOX Round {current_count + 1}] ✅ COMPILATION PASSED. ❌ UNIT TESTS FAILED.\nSTDOUT:\n{stdout_str[:1500]}"
+                else:
+                    print("   ⚠️ Unit Tests: DID NOT RUN (No tests found)")
+                    sandbox_result_str = f"[SANDBOX Round {current_count + 1}] ✅ COMPILATION PASSED. ⚠️ NO TESTS RAN."
+                    # If there's no tests, but vet passed, that's still an AST success
+                    docker_result.passed = True
+        else:
+            print(f"   ❌ Compilation / go vet: REJECTED (exit code {docker_result.exit_code})")
+            print("   ⚠️ Unit Tests: DID NOT RUN (Compilation failed)")
+            sandbox_result_str = (
+                f"[SANDBOX Round {current_count + 1}] ❌ COMPILATION FAILED (exit_code={docker_result.exit_code}).\n"
+                f"STDOUT:\n{stdout_str[:1500]}\n"
+                f"STDERR:\n{stderr_str[:1500]}"
+            )
+        print("   ----------------------------------\n")
 
     return {
         "current_files": current_files,
         "iteration_count": current_count + 1,
-        "ast_is_valid": True,
+        "ast_is_valid": docker_result.passed,
         "shadow_passed": False,
-        # Fix #1: Wipe short-term critique memory HERE, AFTER the Dev Agent has
-        # read and consumed it. consensus_node archives them to full_history
-        # first; we clear the short-term store so the next round of review
-        # agents start with a clean slate.
+        # Persist workspace path so Rounds 2 & 3 reuse the same temp dir
+        # instead of spinning up a new one each iteration.
+        "sandbox_workspace_path": workspace_path,
+        "sandbox_test_result": sandbox_result_str,
+        # Wipe short-term critique memory after Dev Agent has consumed it.
         "active_critiques": [],
         "domain_approvals": {
             "backend": "pending",
@@ -690,7 +725,6 @@ def development_agent_node(state: AgentState):
             "frontend": "pending"
         },
     }
-
 
 def _condense_history(full_log: list, max_entries: int = 12, max_chars_per_entry: int = 120) -> str:
     """

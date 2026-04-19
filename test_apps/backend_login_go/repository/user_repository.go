@@ -3,6 +3,7 @@ package repository
 import (
 	"backend_login_go/model"
 	"database/sql"
+	"errors"
 )
 
 type UserRepository interface {
@@ -24,7 +25,7 @@ func (u *userRepositoryImpl) GetUser(username string) (*model.User, error) {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
-		return nil, err
+		return nil, errors.New("database error: " + err.Error())
 	}
 	return &user, nil
 }

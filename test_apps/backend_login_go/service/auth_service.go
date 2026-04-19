@@ -7,13 +7,16 @@ import (
 )
 
 type AuthService struct {
-	authController controller.AuthController
+	userRepository repository.UserRepository
+	passwordHasher  utils.PasswordHasherInterface
+	errorHandler  controller.ErrorHandlerInterface
 }
 
-func NewAuthService(authController controller.AuthController) *AuthService {
-	return &AuthService{authController: authController}
+func NewAuthService(userRepository repository.UserRepository, passwordHasher utils.PasswordHasherInterface, errorHandler controller.ErrorHandlerInterface) *AuthService {
+	return &AuthService{userRepository: userRepository, passwordHasher: passwordHasher, errorHandler: errorHandler}
 }
 
-func (a *AuthService) Authenticate(c controller.Creds) (*controller.User, error) {
-	return a.authController.Authenticate(c)
+func (a *AuthService) Authenticate(credentials controller.Credentials) (*controller.User, error) {
+	authController := controller.NewAuthController(a.userRepository, a.passwordHasher, a.errorHandler)
+	return authController.Authenticate(credentials)
 }
