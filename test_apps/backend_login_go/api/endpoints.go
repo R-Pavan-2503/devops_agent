@@ -4,8 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"backend_login_go/service"
-	"backend_login_go/errors"
+	"backend_login_go/validation"
 	"time"
+	"strings"
 )
 
 type LoginResponse struct {
@@ -20,21 +21,14 @@ type ResponseWriter interface {
 	http.ResponseWriter
 }
 
-func validateCredentials(username string, password string) error {
-	if username == "" || password == "" {
-		return errors.NewError("username and password are required", http.StatusBadRequest)
-	}
-	if len(password) < 8 {
-		return errors.NewError("password must be at least 8 characters long", http.StatusBadRequest)
-	}
-	return nil
-}
-
 func decodeRequestBody(r *http.Request) (service.Creds, error) {
 	var creds service.Creds
 	err := json.NewDecoder(r.Body).Decode(&creds)
 	if err != nil {
 		return creds, err
+	}
+	if creds.Username == "" || creds.Password == "" {
+		return creds, errors.New("username and password are required")
 	}
 	return creds, nil
 }
@@ -54,12 +48,23 @@ func createLoginErrorResponse(err error) LoginResponse {
 	}
 }
 
-func handleLoginResponse(w ResponseWriter, user *service.User) {
+type ResponseHandler interface {
+	HandleResponse(w ResponseWriter, user *service.User)
+	HandleError(w ResponseWriter, err error)
+}
+
+type responseHandlerImpl struct{}
+
+func NewResponseHandler() ResponseHandler {
+	return &responseHandlerImpl{}
+}
+
+func (r *responseHandlerImpl) HandleResponse(w ResponseWriter, user *service.User) {
 	loginResponse := createLoginResponse(user)
 	json.NewEncoder(w).Encode(loginResponse)
 }
 
-func handleLoginError(w ResponseWriter, err error) {
+func (r *responseHandlerImpl) HandleError(w ResponseWriter, err error) {
 	loginResponse := createLoginErrorResponse(err)
 	json.NewEncoder(w).Encode(loginResponse)
 }
@@ -68,27 +73,31 @@ type AuthServiceInterface interface {
 	Authenticate(creds service.Creds) (*service.User, error)
 }
 
-func LoginEndpoint(authService AuthServiceInterface) http.HandlerFunc {
+func LoginEndpoint(authService AuthServiceInterface, responseHandler ResponseHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		creds, err := decodeRequestBody(r)
 		if err != nil {
-			http.Error(w, errors.NewError("invalid request body", http.StatusBadRequest).Error(), http.StatusBadRequest)
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		err = validateCredentials(creds.Username, creds.Password)
-		if err != nil {
+		if err := validation.ValidateUsername(creds.Username); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if err := validation.ValidatePassword(creds.Password); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
 		user, err := authService.Authenticate(creds)
 		if err != nil {
-			handleLoginError(w, err)
+			responseHandler.HandleError(w, err)
 			return
 		}
 
-		handleLoginResponse(w, user)
+		responseHandler.HandleResponse(w, user)
 	}
 }
 

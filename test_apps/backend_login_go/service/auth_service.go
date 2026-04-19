@@ -4,7 +4,6 @@ import (
 	"backend_login_go/controller"
 	"backend_login_go/repository"
 	"backend_login_go/utils"
-	"backend_login_go/errors"
 )
 
 type AuthService struct {

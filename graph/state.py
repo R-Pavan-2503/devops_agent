@@ -19,6 +19,10 @@ def preserve_if_set(existing: str, new: str) -> str:
         return new
     return existing
 
+# Custom reducer: once True, stays True (shadow pass can't be "un-passed")
+def bool_or(existing: bool, new: bool) -> bool:
+    return existing or new
+
 class AgentState(TypedDict):
     # Ingestion Inputs
     pr_url: str
@@ -29,11 +33,21 @@ class AgentState(TypedDict):
     
     # Smart Routing Flags
     pr_type: str 
-    needs_api_contract_check: bool 
+    needs_api_contract_check: bool
+
+    # Dynamic invocation flags (set by the router node)
+    # True when the PR contains test files — enables QA Agent.
+    pr_has_tests: bool
+    # True when the PR is a documented bugfix/refactor with no UAC — skips Scrum Agent.
+    is_bugfix_or_refactor: bool
     
     # Anti-Bloat & Validation
     document_ids: list[str] 
-    ast_is_valid: bool 
+    ast_is_valid: bool
+
+    # Shadow environment result
+    # Annotated with bool_or so a True can never be overwritten back to False.
+    shadow_passed: Annotated[bool, bool_or]
     
     # Specialist Matrix Votes
     domain_approvals: Annotated[dict, merge_votes] 
@@ -55,12 +69,3 @@ class AgentState(TypedDict):
     # Subsequent rounds reuse it without re-querying ChromaDB.
     # reducer: only update when a non-empty value is returned (preserve_if_set)
     arch_codebase_context: Annotated[str, preserve_if_set]
-
-    # Ephemeral Docker Sandbox (Dev Agent 3-round fix loop)
-    # sandbox_workspace_path: absolute host path to the temp dir created by
-    #   setup_workspace(). persist_if_set keeps it alive across all 3 rounds.
-    #   teardown_workspace() deletes it once in documentation_summarizer_node.
-    # sandbox_test_result: last `go vet` output fed back to the LLM as
-    #   concrete compiler evidence so it knows exactly what still breaks.
-    sandbox_workspace_path: Annotated[str, preserve_if_set]
-    sandbox_test_result: str

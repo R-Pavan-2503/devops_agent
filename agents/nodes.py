@@ -2,10 +2,11 @@ import os
 import re
 import time
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_openai import ChatOpenAI
 from graph.state import AgentState
-from agents.prompts import (
+from agents.old_prompts_v2 import (
     SECURITY_AGENT_PROMPT, BACKEND_ANALYST_AGENT_PROMPT, DEV_AGENT_PROMPT,
     DOC_AGENT_PROMPT, CODE_QUALITY_AGENT_PROMPT, ARCHITECT_AGENT_PROMPT, QA_AGENT_PROMPT,
     FRONTEND_AGENT_PROMPT
@@ -397,45 +398,60 @@ def code_quality_agent_node(state: AgentState):
     }
 
 
-def qa_agent_node(state: AgentState):
+def qa_agent_node(state):
     """
     QA / SDET Agent — Testability Checker.
-
-    Why NO ChromaDB:
-        Checks if the NEW code is testable: dependency injection used?
-        Are interfaces abstracted? Is there input validation? These are
-        universal testability patterns checked against the PR code alone.
-        Uses Llama-4-Scout which has a separate 500K TPD bucket.
-
-    Fix #2 — UAC Injection:
-        If a uac_context is provided, the QA agent is also asked to verify
-        that existing tests explicitly cover the acceptance scenarios defined
-        in the UAC — not just generic branch coverage.
+ 
+    Dynamic invocation:
+        If pr_has_tests=False (set by pr_router_node because no test files
+        were found in the PR), this node self-skips immediately.
+        This saves ~300–500 Groq tokens per pipeline run.
+ 
+    When pr_has_tests=True, runs the full coverage gate and testability review.
     """
+    import time
+    from langchain_core.messages import SystemMessage, HumanMessage
+    from agents.prompts import QA_AGENT_PROMPT
+    from agents.nodes import (
+        invoke_strict, review_llm_scout,
+        format_files_for_llm, safe_print_critique,
+    )
+ 
+    # ── Dynamic skip gate ────────────────────────────────────────────────────
+    if not state.get("pr_has_tests", True):
+        print(" QA Agent: No test files detected — skipping (pr_has_tests=False).")
+        return {
+            "domain_approvals": {"qa": "approved"},
+            "active_critiques": [],  # empty list = no-op with wipeable_add reducer
+        }
+ 
+    # ── Full review path ─────────────────────────────────────────────────────
     time.sleep(2)
     print(" QA Agent: Checking testability and mocks...")
-
-    code = format_files_for_llm(state.get("current_files", {}))
+ 
+    code        = format_files_for_llm(state.get("current_files", {}))
     uac_context = state.get("uac_context", "").strip()
-
+ 
     uac_block = (
         f"User Acceptance Criteria (UAC):\n{uac_context}\n\n"
-        "Also verify that the test suite contains at least one test case \n"
-        "that validates each UAC scenario above. Missing UAC coverage = REJECT.\n\n"
+        "Also verify the test suite contains at least one test case per UAC scenario. "
+        "Missing UAC coverage = REJECT.\n\n"
     ) if uac_context else ""
-
+ 
     messages = [
         SystemMessage(content=QA_AGENT_PROMPT),
-        HumanMessage(content=f"{uac_block}{code}")
+        HumanMessage(content=f"{uac_block}{code}"),
     ]
     ai_review = invoke_strict(messages, review_llm_scout)
-
+ 
     print(f"   -> Vote: {ai_review.vote}")
     safe_print_critique(ai_review.critique)
-
+ 
     return {
         "domain_approvals": {"qa": ai_review.vote},
-        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] QA: {ai_review.critique}"]
+        "active_critiques": [
+            f"[Round {state.get('iteration_count', 0)}] QA: {ai_review.critique}"
+        ],
     }
 
 
@@ -659,8 +675,7 @@ def development_agent_node(state: AgentState):
         "current_files": current_files,
         "iteration_count": current_count + 1,
         "ast_is_valid": True,
-        "sandbox_workspace_path": workspace_path,
-        "sandbox_test_result": sandbox_result_str,
+        "shadow_passed": False,
         # Fix #1: Wipe short-term critique memory HERE, AFTER the Dev Agent has
         # read and consumed it. consensus_node archives them to full_history
         # first; we clear the short-term store so the next round of review

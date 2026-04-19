@@ -14,7 +14,7 @@ type Route struct {
 func RegisterRoutes(authService service.AuthService) *http.ServeMux {
 	mux := http.NewServeMux()
 	routes := []Route{
-		{Path: "/api/login", Handler: api.LoginEndpoint(authService)},
+		{Path: "/api/login", Handler: api.LoginEndpoint(authService, api.NewResponseHandler())},
 		{Path: "/api/profile", Handler: api.ProfileEndpoint},
 	}
 

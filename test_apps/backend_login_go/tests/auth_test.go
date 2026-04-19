@@ -89,6 +89,14 @@ func TestAuthenticate(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "boundary password length",
+			creds: controller.Creds{
+				Username: "admin",
+				Password: "password1",
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -155,25 +163,7 @@ func TestAuthenticate_MockUserRepository_InternalServerError(t *testing.T) {
 		t.Errorf("Authenticate() error = %v, wantErr %v", err, true)
 		return
 	}
-}
-
-func TestAuthenticate_MockUserRepository_MockInternalServerError(t *testing.T) {
-	mockUserRepository := new(mockUserRepository)
-	mockUserRepository.On("GetUser", "admin").Return(nil, sql.ErrConnDone)
-
-	passwordHasher := utils.NewPasswordHasher()
-	errorHandler := controller.NewErrorHandler()
-	authController := controller.NewAuthController(mockUserRepository, passwordHasher, errorHandler)
-	authService := service.NewAuthService(authController)
-
-	creds := controller.Creds{
-		Username: "admin",
-		Password: "password123",
-	}
-
-	_, err := authService.Authenticate(creds)
-	if err == nil {
-		t.Errorf("Authenticate() error = %v, wantErr %v", err, true)
-		return
+	if err.Error() != "internal server error" {
+		t.Errorf("Authenticate() error = %v, want %v", err, "internal server error")
 	}
 }
