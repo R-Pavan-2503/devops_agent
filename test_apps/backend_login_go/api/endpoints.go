@@ -10,10 +10,10 @@ import (
 )
 
 type LoginResponse struct {
-	ID        int       `json:"id"`
-	Username  string    `json:"username"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        int    `json:"id"`
+	Username  string `json:"username"`
+	Status    string `json:"status"`
+	CreatedAt string `json:"created_at"`
 	ErrorMessage string `json:"error_message"`
 	ErrorCode   int      `json:"error_code"`
 }
@@ -79,7 +79,7 @@ func createLoginResponse(user *service.User) LoginResponse {
 		ID:        user.ID,
 		Username:  user.Username,
 		Status:    user.Status,
-		CreatedAt: time.Now(),
+		CreatedAt: time.Now().Format(time.RFC3339),
 	}
 }
 

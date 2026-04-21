@@ -2,14 +2,13 @@ import os
 import re
 import time
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from graph.state import AgentState
-from agents.old_prompts_v2 import (
+from agents.prompts import (
     SECURITY_AGENT_PROMPT, BACKEND_ANALYST_AGENT_PROMPT, DEV_AGENT_PROMPT,
     DOC_AGENT_PROMPT, CODE_QUALITY_AGENT_PROMPT, ARCHITECT_AGENT_PROMPT, QA_AGENT_PROMPT,
-    FRONTEND_AGENT_PROMPT
+    FRONTEND_AGENT_PROMPT, CRITIQUE_RESOLVE_AGENT_PROMPT
 )
 from agents.tools import search_codebase_context
 from agents.sandbox import (
@@ -66,11 +65,11 @@ review_llm_8b = ChatOpenAI(
     temperature=0.0
 )
 
-# QA Agent: separate token bucket from 70b model
+# QA Agent: Use 8b instance for tests to stay within budget
 review_llm_scout = ChatOpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1",
-    model="meta-llama/llama-4-scout-17b-16e-instruct",
+    model="llama-3.1-8b-instant",
     max_tokens=300,
     temperature=0.0
 )
@@ -181,14 +180,59 @@ def safe_print_critique(critique: str):
     safe_str = critique.encode("ascii", errors="replace").decode("ascii")
     print(f"   -> Critique: {safe_str}")
 
-def format_files_for_llm(files_dict) -> str:
+def format_files_numbered(files_dict) -> str:
+    """
+    Coordinate System — Single Source of Truth.
+
+    Prepends 1-indexed line numbers to every line of every file:
+        1: package main
+        2: import "fmt"
+        3: func Login() {
+
+    Purpose:
+      - Eliminates ambiguity: specialists MUST cite coordinates (e.g., api/endpoints.go:26)
+      - Enables surgical fixes: the Dev Agent uses coordinates to target specific lines
+      - State verification: confirms disk code matches what the Dev Agent claimed to fix
+    """
     if not isinstance(files_dict, dict):
         return str(files_dict)
-    
+
+    formatted = ""
+    for filepath, content in files_dict.items():
+        lines = content.split("\n")
+        # Compact format: 1:line instead of 1: line
+        numbered_lines = [f"{i+1}:{line}" for i, line in enumerate(lines)]
+        numbered_content = "\n".join(numbered_lines)
+        formatted += f"\n[FILE: {filepath}]\n{numbered_content}\n"
+    return formatted.strip()
+
+
+def format_files_raw(files_dict) -> str:
+    """
+    Raw formatting — no line numbers.
+    Used when the consumer needs executable/writable code (e.g., disk writes).
+    """
+    if not isinstance(files_dict, dict):
+        return str(files_dict)
+
     formatted = ""
     for filepath, content in files_dict.items():
         formatted += f"\n--- FILE: {filepath} ---\n{content}\n"
     return formatted.strip()
+
+
+def read_file_numbered(filepath: str) -> str:
+    """
+    Reads a single file from disk and returns it with line numbers prepended.
+    Useful for state verification — confirming on-disk code matches state.
+    """
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        numbered = [f"{i+1}: {line.rstrip()}" for i, line in enumerate(lines)]
+        return f"--- FILE: {filepath} ---\n" + "\n".join(numbered)
+    except Exception as e:
+        return f"--- FILE: {filepath} --- ERROR: {e}"
 
 
 # =============================================================================
@@ -209,7 +253,7 @@ def security_agent_node(state: AgentState):
     time.sleep(2)
     print(" Security Agent: Scanning code for vulnerabilities...")
 
-    code = format_files_for_llm(state.get("current_files", {}))
+    code = format_files_numbered(state.get("current_files", {}))
     messages = [
         SystemMessage(content=SECURITY_AGENT_PROMPT),
         HumanMessage(content=f"Review this pull request code for security vulnerabilities:\n\n{code}")
@@ -221,7 +265,7 @@ def security_agent_node(state: AgentState):
 
     return {
         "domain_approvals": {"security": ai_review.vote},
-        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Security: {ai_review.critique}"]
+        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Security: {ai_review.critique}"] if ai_review.vote == "rejected" else []
     }
 
 
@@ -245,7 +289,7 @@ def architecture_agent_node(state: AgentState):
     time.sleep(2)
     print(" Architecture Agent: Checking structural design (with codebase context)...")
 
-    code = format_files_for_llm(state.get("current_files", {}))
+    code = format_files_numbered(state.get("current_files", {}))
     repo_name = state.get("repo_name", "")
     cached_context = state.get("arch_codebase_context", "")
 
@@ -272,7 +316,7 @@ def architecture_agent_node(state: AgentState):
         ]
 
         context_gathered = ""
-        for _ in range(3):  # Up to 3 different pattern searches
+        for _ in range(1):  # Up to 1 different pattern searches (reduced from 3 to save tokens)
             time.sleep(2)
             response = invoke_with_retry(arch_llm_with_tools, messages)
             messages.append(response)
@@ -310,7 +354,7 @@ def architecture_agent_node(state: AgentState):
 
     return {
         "domain_approvals": {"architecture": ai_review.vote},
-        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Architecture: {ai_review.critique}"],
+        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Architecture: {ai_review.critique}"] if ai_review.vote == "rejected" else [],
         "arch_codebase_context": context_to_save  # Empty string on Rounds 2+, preserve_if_set keeps old value
     }
 
@@ -345,7 +389,7 @@ def backend_analyst_node(state: AgentState):
         
     print(" Backend Analyst: Checking functional logic and efficiency...")
 
-    code = format_files_for_llm(state.get("current_files", {}))
+    code = format_files_numbered(state.get("current_files", {}))
     uac_context = state.get("uac_context", "").strip()
 
     uac_block = (
@@ -365,7 +409,7 @@ def backend_analyst_node(state: AgentState):
 
     return {
         "domain_approvals": {"backend": ai_review.vote},
-        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Backend: {ai_review.critique}"]
+        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Backend: {ai_review.critique}"] if ai_review.vote == "rejected" else []
     }
 
 
@@ -382,7 +426,7 @@ def code_quality_agent_node(state: AgentState):
     time.sleep(2)
     print(" Code Quality Agent: Checking for clean code...")
 
-    code = format_files_for_llm(state.get("current_files", {}))
+    code = format_files_numbered(state.get("current_files", {}))
     messages = [
         SystemMessage(content=CODE_QUALITY_AGENT_PROMPT),
         HumanMessage(content=code)
@@ -394,7 +438,7 @@ def code_quality_agent_node(state: AgentState):
 
     return {
         "domain_approvals": {"code_quality": ai_review.vote},
-        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Code Quality: {ai_review.critique}"]
+        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Code Quality: {ai_review.critique}"] if ai_review.vote == "rejected" else []
     }
 
 
@@ -409,14 +453,6 @@ def qa_agent_node(state):
  
     When pr_has_tests=True, runs the full coverage gate and testability review.
     """
-    import time
-    from langchain_core.messages import SystemMessage, HumanMessage
-    from agents.prompts import QA_AGENT_PROMPT
-    from agents.nodes import (
-        invoke_strict, review_llm_scout,
-        format_files_for_llm, safe_print_critique,
-    )
- 
     # ── Dynamic skip gate ────────────────────────────────────────────────────
     if not state.get("pr_has_tests", True):
         print(" QA Agent: No test files detected — skipping (pr_has_tests=False).")
@@ -428,8 +464,8 @@ def qa_agent_node(state):
     # ── Full review path ─────────────────────────────────────────────────────
     time.sleep(2)
     print(" QA Agent: Checking testability and mocks...")
- 
-    code        = format_files_for_llm(state.get("current_files", {}))
+
+    code = format_files_numbered(state.get("current_files", {}))
     uac_context = state.get("uac_context", "").strip()
  
     uac_block = (
@@ -449,9 +485,7 @@ def qa_agent_node(state):
  
     return {
         "domain_approvals": {"qa": ai_review.vote},
-        "active_critiques": [
-            f"[Round {state.get('iteration_count', 0)}] QA: {ai_review.critique}"
-        ],
+        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] QA: {ai_review.critique}"] if ai_review.vote == "rejected" else [],
     }
 
 
@@ -481,7 +515,7 @@ def frontend_agent_node(state: AgentState):
 
     print(" Frontend Agent: Checking API contract and formatting...")
 
-    code = format_files_for_llm(state.get("current_files", {}))
+    code = format_files_numbered(state.get("current_files", {}))
     messages = [
         SystemMessage(content=FRONTEND_AGENT_PROMPT),
         HumanMessage(content=code)
@@ -493,42 +527,101 @@ def frontend_agent_node(state: AgentState):
 
     return {
         "domain_approvals": {"frontend": ai_review.vote},
-        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Frontend: {ai_review.critique}"]
+        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Frontend: {ai_review.critique}"] if ai_review.vote == "rejected" else []
     }
+
+
+def critique_resolve_agent_node(state: AgentState):
+    """
+    Critique Resolve Agent — Conflict Resolution Brain.
+
+    Sits between specialist consensus and the Dev Agent. Produces a single
+    Master Directive by:
+      1. Sorting critiques by priority (Security > QA > Arch > Backend > Frontend > Quality)
+      2. Resolving file:line conflicts (higher priority wins)
+      3. Blocking goalpost shifting (new non-critical categories in Round 2+)
+
+    The Dev Agent reads ONLY the master_directive, never the raw active_critiques.
+
+    LLM: arch_llm (70b, 3000 tokens). Runs sequentially before the Dev Agent,
+    so they never compete for the same API call slot. ~2000 tokens per call.
+    """
+    time.sleep(2)
+    print(" Critique Resolve Agent: Synthesizing critiques into Master Directive...")
+
+    active_critiques = state.get("active_critiques", [])
+    iteration_count = state.get("iteration_count", 0)
+    full_history = state.get("full_history", [])
+
+    if not active_critiques:
+        print("   -> No critiques to resolve. All agents approved.")
+        return {"master_directive": "NO_CRITIQUES — all agents approved."}
+
+    # ── Phase 1: Programmatic Pre-Processing ──────────────────────────────
+    AGENT_PRIORITY = {
+        "security": 1,
+        "qa": 2,
+        "architecture": 3,
+        "backend": 4,
+        "frontend": 5,
+        "code quality": 6,
+        "code_quality": 6,
+    }
+
+    def get_priority(critique_line: str) -> int:
+        lower = critique_line.lower()
+        for agent_key, priority in AGENT_PRIORITY.items():
+            if agent_key in lower:
+                return priority
+        return 99  # Unknown agent, lowest priority
+
+    # Sort critiques so highest-priority agent appears first
+    sorted_critiques = sorted(active_critiques, key=get_priority)
+
+    # Extract Round 1 critiques for loop prevention context
+    round_1_critiques = [c for c in full_history if "[Round 0]" in c]
+
+    # ── Phase 2: LLM Synthesis ────────────────────────────────────────────
+    round_1_text = "\n".join(round_1_critiques) if round_1_critiques else "(This is Round 1 — no prior history)"
+    current_text = "\n".join(sorted_critiques)
+
+    human_content = (
+        f"ITERATION: {iteration_count}\n\n"
+        f"CURRENT_ROUND CRITIQUES (pre-sorted by priority):\n{current_text}\n\n"
+        f"ROUND_1_HISTORY:\n{round_1_text}\n\n"
+        "Produce the Master Directive now."
+    )
+
+    messages = [
+        SystemMessage(content=CRITIQUE_RESOLVE_AGENT_PROMPT),
+        HumanMessage(content=human_content),
+    ]
+
+    time.sleep(3)  # Rate limit buffer after all specialists
+    response = invoke_with_retry(arch_llm, messages)
+
+    master_directive = response.content.strip()
+
+    safe_directive = master_directive.encode("ascii", errors="replace").decode("ascii")
+    print(f"   -> Master Directive:\n{safe_directive}")
+
+    return {"master_directive": master_directive}
 
 
 def development_agent_node(state: AgentState):
     """
     Developer Agent — Code Rewriter + Docker Sandbox Validator.
 
-    Receives the combined critique log from all agents in the current round
-    and rewrites the code to fix all identified issues.
-
-    Sandbox Integration (3-round loop):
-        Round 1 (iteration_count == 0):
-            - setup_workspace() creates the host temp dir and writes all .go files.
-            - go.mod is auto-injected at the Go project root (detected from file paths)
-              so `go vet` works inside Docker without needing network access.
-            - workspace_path is persisted in state so Rounds 2 & 3 can reuse it.
-
-        Rounds 2 & 3 (iteration_count >= 1):
-            - Workspace already exists (path carried in state['sandbox_workspace_path']).
-            - update_workspace_files() patches the sandbox with the new code.
-            - run_tests_in_docker() verifies the new fix.
-
-    go.mod placement:
-        go.mod must live in the same directory as the Go source files, not at the
-        workspace root. The function detects the project root from the file paths:
-          "test_apps/backend_login_go/api/endpoints.go"  →  go.mod at
-          "test_apps/backend_login_go/go.mod"
-        This ensures `import "backend_login_go/service"` resolves correctly inside Docker.
+    Receives the Master Directive from the Critique Resolve Agent (a conflict-
+    resolved, priority-ordered action list) and rewrites the code to fix all
+    identified issues. Uses the 70b model for high-quality code generation.
     """
     time.sleep(2)
     print("Development Agent: Rewriting the code to fix issues...")
 
-    broken_code = format_files_for_llm(state.get("current_files", {}))
+    broken_code = format_files_numbered(state.get("current_files", {}))
     current_count = state.get("iteration_count", 0)
-    critique_log = state.get("active_critiques", [])
+    master_directive = state.get("master_directive", "")
     workspace_path = state.get("sandbox_workspace_path", "")
     prev_docker_result = state.get("sandbox_test_result", "")
 
@@ -582,6 +675,9 @@ def development_agent_node(state: AgentState):
         print(f"   [Sandbox] Workspace patched for Round {current_count + 1}: {workspace_path}")
 
     # ── Build LLM prompt with Docker compiler evidence (if available) ─────
+    active_critiques = state.get("active_critiques", [])
+    critique_log = active_critiques if active_critiques else ["No specific critiques from this round (all approved)."]
+
     docker_evidence_block = (
         f"Docker Sandbox result from previous fix attempt:\n{prev_docker_result}\n\n"
     ) if prev_docker_result else ""
@@ -590,6 +686,7 @@ def development_agent_node(state: AgentState):
 
     human_content = (
         f"Feedback from all reviewers:\n{chr(10).join(critique_log)}\n\n"
+        f"MASTER DIRECTIVE (conflict-resolved, priority-ordered):\n{master_directive}\n\n"
         f"{docker_evidence_block}"
         f"{warning_text}"
         f"Please fix this codebase:\n\n{broken_code}\n\n"
@@ -779,7 +876,7 @@ def documentation_summarizer_node(state: AgentState):
 
     full_log = state.get("full_history", [])
     files_dict = state.get("current_files", {})
-    final_code = format_files_for_llm(files_dict)
+    final_code = format_files_raw(files_dict)
     final_votes = state.get("domain_approvals", {})
     iteration_count = state.get("iteration_count", 0)
 
@@ -839,13 +936,14 @@ def documentation_summarizer_node(state: AgentState):
     # -----------------------------------------------------------------------
     condensed_history = _condense_history(full_log)
     requires_human_review = state.get("requires_human_review", False)
+    master_directive = state.get("master_directive", "None")
 
     human_content = (
         f"VERDICTS:\n{verdicts_table}\n\n"
         f"FINAL_CRITIQUES:\n{final_critiques_block}\n\n"
         f"HISTORY (condensed timeline):\n{condensed_history}\n\n"
-        f"REQUIRES_HUMAN_REVIEW: {requires_human_review}\n\n"
-        f"FINAL_CODE:\n{final_code}"
+        f"MASTER_DIRECTIVE (dropped critiques context):\n{master_directive}\n\n"
+        f"REQUIRES_HUMAN_REVIEW: {requires_human_review}"
     )
 
     messages = [

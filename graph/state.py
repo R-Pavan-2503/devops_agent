@@ -57,6 +57,9 @@ class AgentState(TypedDict):
     full_history: Annotated[list[str], operator.add]      # Long-term: entire journey, never erased
     human_readable_summary: str 
     
+    # Critique Resolve Agent output: conflict-resolved, priority-ordered directive for Dev Agent
+    master_directive: str
+
     # Cyclic Control & Mitigations
     iteration_count: int
     requires_summarization: bool 

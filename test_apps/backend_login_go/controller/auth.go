@@ -5,7 +5,6 @@ import (
 	"backend_login_go/model"
 	"backend_login_go/repository"
 	"backend_login_go/utils"
-	"backend_login_go/validation"
 	"strings"
 )
 
@@ -15,7 +14,7 @@ type Credentials struct {
 }
 
 type User struct {
-	ID       int
+	ID       string
 	Username string
 	Status   string
 	Password string

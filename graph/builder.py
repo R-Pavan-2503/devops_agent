@@ -36,6 +36,7 @@ from agents.nodes import (
     architecture_agent_node,
     qa_agent_node,
     frontend_agent_node,
+    critique_resolve_agent_node
 )
 from agents.router_node import pr_router_node
 from sandbox.shadow_node import shadow_env_node
@@ -65,8 +66,14 @@ def consensus_node(state: AgentState):
     """
     Fan-in point — collects all specialist votes.
 
-    The active_critiques wipe now happens inside development_agent_node
-    (after it reads them), not here.  full_history is always accumulated.
+    Fix #1 — Memory Wipe Bug:
+        active_critiques are NO LONGER wiped here. The Critique Resolve
+        Agent is the primary consumer of these critiques; it must read
+        them BEFORE they are cleared.
+
+        The wipe happens inside development_agent_node, after the CRA
+        has already synthesized them into a master_directive. full_history
+        is still accumulated here so the Doc Agent has the complete journey.
     """
     votes = state.get("domain_approvals", {})
     print(f" Consensus Node: All agents finished. Votes: {votes}")
@@ -93,6 +100,7 @@ workflow.add_node("code_quality_agent_node",       code_quality_agent_node)
 workflow.add_node("architecture_agent_node",       architecture_agent_node)
 workflow.add_node("qa_agent_node",                 qa_agent_node)
 workflow.add_node("frontend_agent_node",           frontend_agent_node)
+workflow.add_node("critique_resolve_agent_node", critique_resolve_agent_node)
 workflow.add_node("consensus_node",                consensus_node)
 workflow.add_node("development_agent_node",        development_agent_node)
 workflow.add_node("shadow_env_node",               shadow_env_node)
@@ -115,8 +123,7 @@ workflow.add_edge("frontend_agent_node",     "consensus_node")
 
 # --- Consensus → dev agent / shadow / fallback ---
 workflow.add_conditional_edges("consensus_node", route_negotiation)
-
-# --- Dev agent always loops back to specialists for re-review ---
+workflow.add_edge("critique_resolve_agent_node", "development_agent_node")
 workflow.add_edge("development_agent_node", "backend_analyst_node")
 
 # --- Shadow env → re-review loop OR docs ---

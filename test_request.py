@@ -13,18 +13,28 @@ from graph.builder import app
 
 print("\n[START] Starting Simulated PR Review Pipeline...")
 
-MOCK_DIR  = "test_apps/backend_login_go"
+MOCK_DIR  = "test_apps/backend_login_cs"
 REPO_NAME = "backend_pandhi"
 
 current_files = {}
 try:
     for root, dirs, files in os.walk(MOCK_DIR):
+        dirs[:] = [d for d in dirs if d not in ["node_modules", ".git", "__pycache__", "dist", "build", "venv", ".venv"]]
         for file in files:
-            if file.endswith(".go"):
+            valid_extensions = (
+                '.go', '.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.c', '.cpp', 
+                '.h', '.hpp', '.cs', '.rb', '.php', '.swift', '.kt', '.rs', '.m', 
+                '.html', '.css', '.json', '.sh', '.yaml', '.yml', '.sql'
+            )
+            if file.endswith(valid_extensions):
                 filepath = os.path.join(root, file)
                 normalized_path = filepath.replace("\\", "/")
-                with open(filepath, "r", encoding="utf-8") as f:
-                    current_files[normalized_path] = f.read()
+                try:
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        current_files[normalized_path] = f.read()
+                except UnicodeDecodeError:
+                    pass
+
 except Exception as e:
     print(f"Error reading mock directory {MOCK_DIR}: {e}")
     sys.exit(1)
@@ -71,5 +81,7 @@ print(f"[TEST] Simulating PR review for repository: {REPO_NAME}\n")
 for output in app.stream(initial_state):
     for node_name, result in output.items():
         print(f"\n[OK] {node_name} Finished Processing.")
-
+        #print(result)
+        print("**********************************************************")
+        
 print("\n[DONE] Full testing simulation complete!")

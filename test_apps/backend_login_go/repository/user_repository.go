@@ -20,7 +20,7 @@ func NewUserRepository(db *sql.DB) UserRepository {
 
 func (u *userRepositoryImpl) GetUser(username string) (*model.User, error) {
 	var user model.User
-	err := u.db.QueryRow("SELECT id, username, status, password FROM users WHERE username = $1", username).Scan(&user.ID, &user.Username, &user.Status, &user.Password)
+	err := u.db.QueryRow("SELECT id, username, status, password, created_at FROM users WHERE username = $1", username).Scan(&user.ID, &user.Username, &user.Status, &user.Password, &user.CreatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
