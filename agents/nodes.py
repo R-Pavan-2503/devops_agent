@@ -43,7 +43,7 @@ arch_llm = ChatOpenAI(
     base_url="https://api.groq.com/openai/v1",
     model="llama-3.3-70b-versatile",
     max_tokens=3000,
-    temperature=0.0
+    temperature=0.2
 )
 
 # High-quality reviewer: complex backend logic analysis
@@ -52,7 +52,7 @@ review_llm_70b = ChatOpenAI(
     base_url="https://api.groq.com/openai/v1",
     model="llama-3.3-70b-versatile",
     max_tokens=300,
-    temperature=0.0
+    temperature=0.2
 )
 
 # Fast reviewer: universal rule-based checks (security, quality, frontend)
@@ -62,7 +62,7 @@ review_llm_8b = ChatOpenAI(
     base_url="https://api.groq.com/openai/v1",
     model="llama-3.1-8b-instant",
     max_tokens=300,
-    temperature=0.0
+    temperature=0.2
 )
 
 # QA Agent: Use 8b instance for tests to stay within budget
@@ -71,7 +71,7 @@ review_llm_scout = ChatOpenAI(
     base_url="https://api.groq.com/openai/v1",
     model="llama-3.1-8b-instant",
     max_tokens=300,
-    temperature=0.0
+    temperature=0.2
 )
 
 # =============================================================================
