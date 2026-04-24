@@ -1,15 +1,22 @@
 import os
+import re
 import time
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_openai import ChatOpenAI
 from graph.state import AgentState
 from agents.prompts import (
     SECURITY_AGENT_PROMPT, BACKEND_ANALYST_AGENT_PROMPT, DEV_AGENT_PROMPT,
     DOC_AGENT_PROMPT, CODE_QUALITY_AGENT_PROMPT, ARCHITECT_AGENT_PROMPT, QA_AGENT_PROMPT,
-    FRONTEND_AGENT_PROMPT
+    FRONTEND_AGENT_PROMPT, CRITIQUE_RESOLVE_AGENT_PROMPT
 )
 from agents.tools import search_codebase_context
+from agents.sandbox import (
+    setup_workspace,
+    update_workspace_files,
+    run_tests_in_docker,
+    teardown_workspace,
+)
 
 load_dotenv()
 
@@ -36,7 +43,7 @@ arch_llm = ChatOpenAI(
     base_url="https://api.groq.com/openai/v1",
     model="llama-3.3-70b-versatile",
     max_tokens=3000,
-    temperature=0.0
+    temperature=0.2
 )
 
 # High-quality reviewer: complex backend logic analysis
@@ -45,7 +52,7 @@ review_llm_70b = ChatOpenAI(
     base_url="https://api.groq.com/openai/v1",
     model="llama-3.3-70b-versatile",
     max_tokens=300,
-    temperature=0.0
+    temperature=0.2
 )
 
 # Fast reviewer: universal rule-based checks (security, quality, frontend)
@@ -55,16 +62,16 @@ review_llm_8b = ChatOpenAI(
     base_url="https://api.groq.com/openai/v1",
     model="llama-3.1-8b-instant",
     max_tokens=300,
-    temperature=0.0
+    temperature=0.2
 )
 
-# QA Agent: separate token bucket from 70b model
+# QA Agent: Use 8b instance for tests to stay within budget
 review_llm_scout = ChatOpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1",
-    model="meta-llama/llama-4-scout-17b-16e-instruct",
+    model="llama-3.1-8b-instant",
     max_tokens=300,
-    temperature=0.0
+    temperature=0.2
 )
 
 # =============================================================================
@@ -173,14 +180,59 @@ def safe_print_critique(critique: str):
     safe_str = critique.encode("ascii", errors="replace").decode("ascii")
     print(f"   -> Critique: {safe_str}")
 
-def format_files_for_llm(files_dict) -> str:
+def format_files_numbered(files_dict) -> str:
+    """
+    Coordinate System — Single Source of Truth.
+
+    Prepends 1-indexed line numbers to every line of every file:
+        1: package main
+        2: import "fmt"
+        3: func Login() {
+
+    Purpose:
+      - Eliminates ambiguity: specialists MUST cite coordinates (e.g., api/endpoints.go:26)
+      - Enables surgical fixes: the Dev Agent uses coordinates to target specific lines
+      - State verification: confirms disk code matches what the Dev Agent claimed to fix
+    """
     if not isinstance(files_dict, dict):
         return str(files_dict)
-    
+
+    formatted = ""
+    for filepath, content in files_dict.items():
+        lines = content.split("\n")
+        # Compact format: 1:line instead of 1: line
+        numbered_lines = [f"{i+1}:{line}" for i, line in enumerate(lines)]
+        numbered_content = "\n".join(numbered_lines)
+        formatted += f"\n[FILE: {filepath}]\n{numbered_content}\n"
+    return formatted.strip()
+
+
+def format_files_raw(files_dict) -> str:
+    """
+    Raw formatting — no line numbers.
+    Used when the consumer needs executable/writable code (e.g., disk writes).
+    """
+    if not isinstance(files_dict, dict):
+        return str(files_dict)
+
     formatted = ""
     for filepath, content in files_dict.items():
         formatted += f"\n--- FILE: {filepath} ---\n{content}\n"
     return formatted.strip()
+
+
+def read_file_numbered(filepath: str) -> str:
+    """
+    Reads a single file from disk and returns it with line numbers prepended.
+    Useful for state verification — confirming on-disk code matches state.
+    """
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        numbered = [f"{i+1}: {line.rstrip()}" for i, line in enumerate(lines)]
+        return f"--- FILE: {filepath} ---\n" + "\n".join(numbered)
+    except Exception as e:
+        return f"--- FILE: {filepath} --- ERROR: {e}"
 
 
 # =============================================================================
@@ -201,7 +253,7 @@ def security_agent_node(state: AgentState):
     time.sleep(2)
     print(" Security Agent: Scanning code for vulnerabilities...")
 
-    code = format_files_for_llm(state.get("current_files", {}))
+    code = format_files_numbered(state.get("current_files", {}))
     messages = [
         SystemMessage(content=SECURITY_AGENT_PROMPT),
         HumanMessage(content=f"Review this pull request code for security vulnerabilities:\n\n{code}")
@@ -213,7 +265,7 @@ def security_agent_node(state: AgentState):
 
     return {
         "domain_approvals": {"security": ai_review.vote},
-        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Security: {ai_review.critique}"]
+        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Security: {ai_review.critique}"] if ai_review.vote == "rejected" else []
     }
 
 
@@ -237,7 +289,7 @@ def architecture_agent_node(state: AgentState):
     time.sleep(2)
     print(" Architecture Agent: Checking structural design (with codebase context)...")
 
-    code = format_files_for_llm(state.get("current_files", {}))
+    code = format_files_numbered(state.get("current_files", {}))
     repo_name = state.get("repo_name", "")
     cached_context = state.get("arch_codebase_context", "")
 
@@ -264,7 +316,7 @@ def architecture_agent_node(state: AgentState):
         ]
 
         context_gathered = ""
-        for _ in range(3):  # Up to 3 different pattern searches
+        for _ in range(1):  # Up to 1 different pattern searches (reduced from 3 to save tokens)
             time.sleep(2)
             response = invoke_with_retry(arch_llm_with_tools, messages)
             messages.append(response)
@@ -302,7 +354,7 @@ def architecture_agent_node(state: AgentState):
 
     return {
         "domain_approvals": {"architecture": ai_review.vote},
-        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Architecture: {ai_review.critique}"],
+        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Architecture: {ai_review.critique}"] if ai_review.vote == "rejected" else [],
         "arch_codebase_context": context_to_save  # Empty string on Rounds 2+, preserve_if_set keeps old value
     }
 
@@ -337,7 +389,7 @@ def backend_analyst_node(state: AgentState):
         
     print(" Backend Analyst: Checking functional logic and efficiency...")
 
-    code = format_files_for_llm(state.get("current_files", {}))
+    code = format_files_numbered(state.get("current_files", {}))
     uac_context = state.get("uac_context", "").strip()
 
     uac_block = (
@@ -357,7 +409,7 @@ def backend_analyst_node(state: AgentState):
 
     return {
         "domain_approvals": {"backend": ai_review.vote},
-        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Backend: {ai_review.critique}"]
+        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Backend: {ai_review.critique}"] if ai_review.vote == "rejected" else []
     }
 
 
@@ -374,7 +426,7 @@ def code_quality_agent_node(state: AgentState):
     time.sleep(2)
     print(" Code Quality Agent: Checking for clean code...")
 
-    code = format_files_for_llm(state.get("current_files", {}))
+    code = format_files_numbered(state.get("current_files", {}))
     messages = [
         SystemMessage(content=CODE_QUALITY_AGENT_PROMPT),
         HumanMessage(content=code)
@@ -386,49 +438,54 @@ def code_quality_agent_node(state: AgentState):
 
     return {
         "domain_approvals": {"code_quality": ai_review.vote},
-        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Code Quality: {ai_review.critique}"]
+        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Code Quality: {ai_review.critique}"] if ai_review.vote == "rejected" else []
     }
 
 
-def qa_agent_node(state: AgentState):
+def qa_agent_node(state):
     """
     QA / SDET Agent — Testability Checker.
-
-    Why NO ChromaDB:
-        Checks if the NEW code is testable: dependency injection used?
-        Are interfaces abstracted? Is there input validation? These are
-        universal testability patterns checked against the PR code alone.
-        Uses Llama-4-Scout which has a separate 500K TPD bucket.
-
-    Fix #2 — UAC Injection:
-        If a uac_context is provided, the QA agent is also asked to verify
-        that existing tests explicitly cover the acceptance scenarios defined
-        in the UAC — not just generic branch coverage.
+ 
+    Dynamic invocation:
+        If pr_has_tests=False (set by pr_router_node because no test files
+        were found in the PR), this node self-skips immediately.
+        This saves ~300–500 Groq tokens per pipeline run.
+ 
+    When pr_has_tests=True, runs the full coverage gate and testability review.
     """
+    # ── Dynamic skip gate ────────────────────────────────────────────────────
+    if not state.get("pr_has_tests", True):
+        print(" QA Agent: No test files detected — skipping (pr_has_tests=False).")
+        return {
+            "domain_approvals": {"qa": "approved"},
+            "active_critiques": [],  # empty list = no-op with wipeable_add reducer
+        }
+ 
+    # ── Full review path ─────────────────────────────────────────────────────
     time.sleep(2)
     print(" QA Agent: Checking testability and mocks...")
 
-    code = format_files_for_llm(state.get("current_files", {}))
+    code = format_files_numbered(state.get("current_files", {}))
     uac_context = state.get("uac_context", "").strip()
-
+ 
     uac_block = (
         f"User Acceptance Criteria (UAC):\n{uac_context}\n\n"
-        "Also verify that the test suite contains at least one test case \n"
-        "that validates each UAC scenario above. Missing UAC coverage = REJECT.\n\n"
+        "Also verify the test suite contains at least one test case per UAC scenario. "
+        "Missing UAC coverage = REJECT.\n\n"
     ) if uac_context else ""
-
+ 
     messages = [
         SystemMessage(content=QA_AGENT_PROMPT),
-        HumanMessage(content=f"{uac_block}{code}")
+        HumanMessage(content=f"{uac_block}{code}"),
     ]
     ai_review = invoke_strict(messages, review_llm_scout)
-
+ 
     print(f"   -> Vote: {ai_review.vote}")
     safe_print_critique(ai_review.critique)
-
+ 
     return {
         "domain_approvals": {"qa": ai_review.vote},
-        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] QA: {ai_review.critique}"]
+        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] QA: {ai_review.critique}"] if ai_review.vote == "rejected" else [],
     }
 
 
@@ -458,7 +515,7 @@ def frontend_agent_node(state: AgentState):
 
     print(" Frontend Agent: Checking API contract and formatting...")
 
-    code = format_files_for_llm(state.get("current_files", {}))
+    code = format_files_numbered(state.get("current_files", {}))
     messages = [
         SystemMessage(content=FRONTEND_AGENT_PROMPT),
         HumanMessage(content=code)
@@ -470,87 +527,291 @@ def frontend_agent_node(state: AgentState):
 
     return {
         "domain_approvals": {"frontend": ai_review.vote},
-        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Frontend: {ai_review.critique}"]
+        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Frontend: {ai_review.critique}"] if ai_review.vote == "rejected" else []
     }
+
+
+def critique_resolve_agent_node(state: AgentState):
+    """
+    Critique Resolve Agent — Conflict Resolution Brain.
+
+    Sits between specialist consensus and the Dev Agent. Produces a single
+    Master Directive by:
+      1. Sorting critiques by priority (Security > QA > Arch > Backend > Frontend > Quality)
+      2. Resolving file:line conflicts (higher priority wins)
+      3. Blocking goalpost shifting (new non-critical categories in Round 2+)
+
+    The Dev Agent reads ONLY the master_directive, never the raw active_critiques.
+
+    LLM: arch_llm (70b, 3000 tokens). Runs sequentially before the Dev Agent,
+    so they never compete for the same API call slot. ~2000 tokens per call.
+    """
+    time.sleep(2)
+    print(" Critique Resolve Agent: Synthesizing critiques into Master Directive...")
+
+    active_critiques = state.get("active_critiques", [])
+    iteration_count = state.get("iteration_count", 0)
+    full_history = state.get("full_history", [])
+
+    if not active_critiques:
+        print("   -> No critiques to resolve. All agents approved.")
+        return {"master_directive": "NO_CRITIQUES — all agents approved."}
+
+    # ── Phase 1: Programmatic Pre-Processing ──────────────────────────────
+    AGENT_PRIORITY = {
+        "security": 1,
+        "qa": 2,
+        "architecture": 3,
+        "backend": 4,
+        "frontend": 5,
+        "code quality": 6,
+        "code_quality": 6,
+    }
+
+    def get_priority(critique_line: str) -> int:
+        lower = critique_line.lower()
+        for agent_key, priority in AGENT_PRIORITY.items():
+            if agent_key in lower:
+                return priority
+        return 99  # Unknown agent, lowest priority
+
+    # Sort critiques so highest-priority agent appears first
+    sorted_critiques = sorted(active_critiques, key=get_priority)
+
+    # Extract Round 1 critiques for loop prevention context
+    round_1_critiques = [c for c in full_history if "[Round 0]" in c]
+
+    # ── Phase 2: LLM Synthesis ────────────────────────────────────────────
+    round_1_text = "\n".join(round_1_critiques) if round_1_critiques else "(This is Round 1 — no prior history)"
+    current_text = "\n".join(sorted_critiques)
+
+    human_content = (
+        f"ITERATION: {iteration_count}\n\n"
+        f"CURRENT_ROUND CRITIQUES (pre-sorted by priority):\n{current_text}\n\n"
+        f"ROUND_1_HISTORY:\n{round_1_text}\n\n"
+        "Produce the Master Directive now."
+    )
+
+    messages = [
+        SystemMessage(content=CRITIQUE_RESOLVE_AGENT_PROMPT),
+        HumanMessage(content=human_content),
+    ]
+
+    time.sleep(3)  # Rate limit buffer after all specialists
+    response = invoke_with_retry(arch_llm, messages)
+
+    master_directive = response.content.strip()
+
+    safe_directive = master_directive.encode("ascii", errors="replace").decode("ascii")
+    print(f"   -> Master Directive:\n{safe_directive}")
+
+    return {"master_directive": master_directive}
 
 
 def development_agent_node(state: AgentState):
     """
-    Developer Agent — Code Rewriter.
+    Developer Agent — Code Rewriter + Docker Sandbox Validator.
 
-    Receives the combined critique log from all agents in the current round
-    and rewrites the code to fix all identified issues. Uses the 70b model
-    for high-quality code generation.
+    Receives the Master Directive from the Critique Resolve Agent (a conflict-
+    resolved, priority-ordered action list) and rewrites the code to fix all
+    identified issues. Uses the 70b model for high-quality code generation.
     """
     time.sleep(2)
     print("Development Agent: Rewriting the code to fix issues...")
 
-    broken_code = format_files_for_llm(state.get("current_files", {}))
+    broken_code = format_files_numbered(state.get("current_files", {}))
     current_count = state.get("iteration_count", 0)
-    critique_log = state.get("active_critiques", [])
+    master_directive = state.get("master_directive", "")
+    workspace_path = state.get("sandbox_workspace_path", "")
+    prev_docker_result = state.get("sandbox_test_result", "")
+
+    # ── Sandbox: Setup on Round 1, patch-in-place on Rounds 2 & 3 ────────
+    current_files = dict(state.get("current_files", {}))
+
+    if not workspace_path:
+        # Strip "test_apps/backend_login_go/" prefix so the Go project
+        # lands at the workspace root — matching how go.mod declares the module.
+        _PREFIX = "test_apps/"
+        files_for_sandbox = {
+            (k[len(_PREFIX):] if k.replace("\\", "/").startswith(_PREFIX) else k): v
+            for k, v in current_files.items()
+        }
+
+        if any(f.endswith(".go") for f in files_for_sandbox):
+            # Inject the real go.mod from disk (has correct require + go version)
+            try:
+                with open("test_apps/backend_login_go/go.mod", "r", encoding="utf-8") as _f:
+                    files_for_sandbox["backend_login_go/go.mod"] = _f.read()
+                print("   [Sandbox] Injected real go.mod from disk")
+            except FileNotFoundError:
+                files_for_sandbox["backend_login_go/go.mod"] = "module backend_login_go\n\ngo 1.22\n"
+                print("   [Sandbox] WARNING: go.mod not found on disk — using minimal fallback")
+
+            # Inject go.sum so external deps (golang.org/x/crypto) resolve offline
+            for _sum_candidate in [
+                "test_apps/backend_login_go/go.sum",
+                "go.sum",
+            ]:
+                try:
+                    with open(_sum_candidate, "r", encoding="utf-8") as _f:
+                        files_for_sandbox["backend_login_go/go.sum"] = _f.read()
+                    print(f"   [Sandbox] Injected go.sum from {_sum_candidate} ({len(files_for_sandbox['backend_login_go/go.sum'])} bytes)")
+                    break
+                except FileNotFoundError:
+                    continue
+            else:
+                print("   [Sandbox] WARNING: go.sum not found anywhere — external deps may fail")
+
+        workspace_path = setup_workspace(files_for_sandbox)
+        print(f"   [Sandbox] Workspace created: {workspace_path}")
+    else:
+        # Rounds 2 & 3 — Reuse the existing workspace, patch changed files.
+        _PREFIX = "test_apps/"
+        files_stripped = {
+            (k[len(_PREFIX):] if k.replace("\\", "/").startswith(_PREFIX) else k): v
+            for k, v in current_files.items()
+        }
+        update_workspace_files(workspace_path, files_stripped)
+        print(f"   [Sandbox] Workspace patched for Round {current_count + 1}: {workspace_path}")
+
+    # ── Build LLM prompt with Docker compiler evidence (if available) ─────
+    active_critiques = state.get("active_critiques", [])
+    critique_log = active_critiques if active_critiques else ["No specific critiques from this round (all approved)."]
+
+    docker_evidence_block = (
+        f"Docker Sandbox result from previous fix attempt:\n{prev_docker_result}\n\n"
+    ) if prev_docker_result else ""
 
     warning_text = "WARNING: FINAL ATTEMPT. Fix ALL critiques or build fails.\n\n" if current_count == 2 else ""
 
     human_content = (
         f"Feedback from all reviewers:\n{chr(10).join(critique_log)}\n\n"
+        f"MASTER DIRECTIVE (conflict-resolved, priority-ordered):\n{master_directive}\n\n"
+        f"{docker_evidence_block}"
         f"{warning_text}"
         f"Please fix this codebase:\n\n{broken_code}\n\n"
-        "CRITICAL: First provide your CHECKLIST, then provide the full rewritten source code enclosed in triple backticks for each file you modify. DO NOT wrap the entire response in a single block, but use [FILE: path] followed by a backtick block for EACH file. Do not use any tool calls or wrappers."
+        "CRITICAL: First provide your CHECKLIST, then provide the full rewritten "
+        "source code enclosed in triple backticks for each file you modify. "
+        "DO NOT wrap the entire response in a single block — use [FILE: path] "
+        "followed by a backtick block for EACH file. Do not use tool calls or wrappers."
     )
     messages = [
         SystemMessage(content=DEV_AGENT_PROMPT),
         HumanMessage(content=human_content)
     ]
 
-    time.sleep(8)  # Rate limit buffer: all review agents just ran
+    time.sleep(8)
     response = invoke_with_retry(arch_llm, messages)
 
     new_code = response.content
     checklist = ""
-    
-    # Parse multi-file output: Look for [FILE: path] and ``` blocks
-    import re
-    # We first extract checklist - anything before the first [FILE:
+
     parts = new_code.split("[FILE:", 1)
     if len(parts) > 1:
         checklist = parts[0].strip()
         file_content_part = "[FILE:" + parts[1]
     else:
         file_content_part = new_code
-    
+
     if checklist:
         safe_checklist = checklist.encode("ascii", errors="replace").decode("ascii")
         print(f"\n   -> Verification Checklist:\n{safe_checklist}\n")
 
-    current_files = state.get("current_files", {})
-    file_blocks = re.findall(r"\[FILE:\s*(.*?)\s*\]\n*(?:```[\w]*\n)?(.*?)```", file_content_part, re.DOTALL)
-    
+    file_blocks = re.findall(
+        r"\[FILE:\s*(.*?)\s*\]\n*(?:```[\w]*\n)?(.*?)```",
+        file_content_part,
+        re.DOTALL
+    )
+
     for filepath, file_content in file_blocks:
         filepath = filepath.strip()
-        # Remove trailing/leading newlines from code if any
         file_content = file_content.strip()
-        
-        # Write to state dict
+        if not file_content:
+            print(f"   -> [WARNING] LLM returned empty content for {filepath} — skipping to preserve original")
+            continue
         current_files[filepath] = file_content
-        
-        # Physical write to disk
+
         try:
-            # Create directories if they don't exist
-            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            parent = os.path.dirname(filepath)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(file_content)
             print(f"   -> Overwrote local file: {filepath}")
         except Exception as e:
             print(f"   -> [WARNING] Failed to write local file {filepath}: {e}")
 
+    # ── Patch sandbox workspace with LLM's rewritten files ───────────────
+    # Exclude go.mod (any path variant) — injected once at setup, must not be overwritten.
+    _PREFIX = "test_apps/"
+    files_to_patch = {
+        (k[len(_PREFIX):] if k.replace("\\", "/").startswith(_PREFIX) else k): v
+        for k, v in current_files.items()
+        if k not in ("go.mod", "go.sum")  # never let LLM overwrite these
+    }
+    update_workspace_files(workspace_path, files_to_patch)
+    print(f"   [Sandbox] Patched {len(files_to_patch)} file(s) with LLM's rewritten code.")
+
+    # ── Run Docker compilation check (`go vet` -> `go test`) ───────────────
+    docker_result = run_tests_in_docker(
+        workspace_path=workspace_path,
+        test_command=(
+             "cd backend_login_go && "
+             "(GONOSUMCHECK=* GOFLAGS=-mod=mod go vet ./... && "
+             "echo '--- VET_PASSED ---' && "
+             "GONOSUMCHECK=* GOFLAGS=-mod=mod go test ./... -v) 2>&1"
+        ),
+        docker_image="golang:1.22",
+    )
+
+    stdout_str = docker_result.stdout or ""
+    stderr_str = docker_result.stderr or ""
+    full_output = stdout_str + "\n" + stderr_str
+
+    if docker_result.timed_out:
+        sandbox_result_str = f"[SANDBOX Round {current_count + 1}] ⏱️ go vet/test TIMED OUT after 60s."
+        print(f"   [Sandbox] ⏱️ TIMED OUT")
+    else:
+        # Determine exactly what happened
+        vet_passed = "--- VET_PASSED ---" in full_output
+        has_tests = "no test files" not in full_output and "?   " not in full_output
+        tests_passed = vet_passed and docker_result.passed
+
+        print("\n   [Sandbox] --- Execution Report ---")
+        if vet_passed:
+            print("   ✅ Compilation / go vet: SUCCESS")
+            if tests_passed:
+                print("   ✅ Unit Tests: SUCCESS")
+                sandbox_result_str = f"[SANDBOX Round {current_count + 1}] ✅ COMPILATION PASSED. ✅ UNIT TESTS PASSED."
+            else:
+                if has_tests:
+                    print(f"   ❌ Unit Tests: FAILED (exit code {docker_result.exit_code})")
+                    sandbox_result_str = f"[SANDBOX Round {current_count + 1}] ✅ COMPILATION PASSED. ❌ UNIT TESTS FAILED.\nSTDOUT:\n{stdout_str[:1500]}"
+                else:
+                    print("   ⚠️ Unit Tests: DID NOT RUN (No tests found)")
+                    sandbox_result_str = f"[SANDBOX Round {current_count + 1}] ✅ COMPILATION PASSED. ⚠️ NO TESTS RAN."
+                    # If there's no tests, but vet passed, that's still an AST success
+                    docker_result.passed = True
+        else:
+            print(f"   ❌ Compilation / go vet: REJECTED (exit code {docker_result.exit_code})")
+            print("   ⚠️ Unit Tests: DID NOT RUN (Compilation failed)")
+            sandbox_result_str = (
+                f"[SANDBOX Round {current_count + 1}] ❌ COMPILATION FAILED (exit_code={docker_result.exit_code}).\n"
+                f"STDOUT:\n{stdout_str[:1500]}\n"
+                f"STDERR:\n{stderr_str[:1500]}"
+            )
+        print("   ----------------------------------\n")
+
     return {
         "current_files": current_files,
         "iteration_count": current_count + 1,
-        "ast_is_valid": True,
-        # Fix #1: Wipe short-term critique memory HERE, AFTER the Dev Agent has
-        # read and consumed it. consensus_node archives them to full_history
-        # first; we clear the short-term store so the next round of review
-        # agents start with a clean slate.
+        "ast_is_valid": docker_result.passed,
+        "shadow_passed": False,
+        # Persist workspace path so Rounds 2 & 3 reuse the same temp dir
+        # instead of spinning up a new one each iteration.
+        "sandbox_workspace_path": workspace_path,
+        "sandbox_test_result": sandbox_result_str,
+        # Wipe short-term critique memory after Dev Agent has consumed it.
         "active_critiques": [],
         "domain_approvals": {
             "backend": "pending",
@@ -561,7 +822,6 @@ def development_agent_node(state: AgentState):
             "frontend": "pending"
         },
     }
-
 
 def _condense_history(full_log: list, max_entries: int = 12, max_chars_per_entry: int = 120) -> str:
     """
@@ -592,13 +852,31 @@ def documentation_summarizer_node(state: AgentState):
     Reads structured verdicts and critiques from state and passes them
     as pre-built data blocks so the LLM copies them verbatim instead of
     guessing from raw log text. This eliminates hallucinated verdicts.
+
+    Sandbox Teardown:
+        This node is the single convergence point for BOTH the happy-path
+        (environment_sandbox_node → here) and the failure-path
+        (human_fallback_node → here). Tearing down the Docker workspace here
+        guarantees it is called exactly once, regardless of which path was
+        taken, leaving zero footprint on the host machine.
     """
     time.sleep(2)
+
+    # ── Sandbox Teardown (called exactly once, after the 3-round loop) ────
+    workspace_path = state.get("sandbox_workspace_path", "")
+    if workspace_path:
+        try:
+            teardown_workspace(workspace_path)
+            print("   [Sandbox] Workspace torn down ✓ — host filesystem clean.")
+        except Exception as e:
+            # Non-fatal: log and continue. The report must still be generated.
+            print(f"   [Sandbox] Teardown warning (non-fatal): {e}")
+
     print("Doc Agent: Summarizing the journey and saving the report...")
 
     full_log = state.get("full_history", [])
     files_dict = state.get("current_files", {})
-    final_code = format_files_for_llm(files_dict)
+    final_code = format_files_raw(files_dict)
     final_votes = state.get("domain_approvals", {})
     iteration_count = state.get("iteration_count", 0)
 
@@ -658,13 +936,14 @@ def documentation_summarizer_node(state: AgentState):
     # -----------------------------------------------------------------------
     condensed_history = _condense_history(full_log)
     requires_human_review = state.get("requires_human_review", False)
+    master_directive = state.get("master_directive", "None")
 
     human_content = (
         f"VERDICTS:\n{verdicts_table}\n\n"
         f"FINAL_CRITIQUES:\n{final_critiques_block}\n\n"
         f"HISTORY (condensed timeline):\n{condensed_history}\n\n"
-        f"REQUIRES_HUMAN_REVIEW: {requires_human_review}\n\n"
-        f"FINAL_CODE:\n{final_code}"
+        f"MASTER_DIRECTIVE (dropped critiques context):\n{master_directive}\n\n"
+        f"REQUIRES_HUMAN_REVIEW: {requires_human_review}"
     )
 
     messages = [

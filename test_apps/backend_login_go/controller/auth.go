@@ -5,46 +5,90 @@ import (
 	"backend_login_go/model"
 	"backend_login_go/repository"
 	"backend_login_go/utils"
+	"strings"
 )
 
-type Creds struct {
+type Credentials struct {
 	Username string
 	Password string
 }
 
 type User struct {
-	ID       int
+	ID       string
 	Username string
 	Status   string
+	Password string
 }
 
-type AuthController struct {
-	userRepository repository.UserRepository
-	passwordHasher  utils.PasswordHasher
+type AuthController interface {
+	Authenticate(credentials Credentials) (*User, error)
 }
 
-func NewAuthController(userRepository repository.UserRepository, passwordHasher utils.PasswordHasher) *AuthController {
-	return &AuthController{userRepository: userRepository, passwordHasher: passwordHasher}
+type UserRepositoryInterface interface {
+	GetUser(username string) (*model.User, error)
 }
 
-func (a *AuthController) Authenticate(c Creds) (*User, error) {
-	if c.Username == "" || c.Password == "" {
-		return nil, errors.NewError("username and password are required", http.StatusBadRequest)
+type PasswordHasherInterface interface {
+	CompareHashAndPassword(hashedPassword string, password string) error
+	HashPassword(password string) (string, error)
+}
+
+type ErrorHandlerInterface interface {
+	HandleError(message string, code int) error
+}
+
+type authControllerImpl struct {
+	userRepository UserRepositoryInterface
+	passwordHasher  PasswordHasherInterface
+	errorHandler   ErrorHandlerInterface
+}
+
+func NewAuthController(userRepository UserRepositoryInterface, passwordHasher PasswordHasherInterface, errorHandler ErrorHandlerInterface) AuthController {
+	return &authControllerImpl{userRepository: userRepository, passwordHasher: passwordHasher, errorHandler: errorHandler}
+}
+
+func (a *authControllerImpl) Authenticate(credentials Credentials) (*User, error) {
+	if credentials.Username == "" || credentials.Password == "" {
+		return nil, a.errorHandler.HandleError("username and password are required", http.StatusBadRequest)
+	}
+	if err := validation.ValidateUsername(credentials.Username); err != nil {
+		return nil, a.errorHandler.HandleError(err.Error(), http.StatusBadRequest)
+	}
+	if err := validation.ValidatePassword(credentials.Password); err != nil {
+		return nil, a.errorHandler.HandleError(err.Error(), http.StatusBadRequest)
 	}
 
-	user, err := a.userRepository.GetUser(c.Username)
+	user, err := a.getUser(credentials.Username)
 	if err != nil {
-		return nil, errors.NewError("internal server error", http.StatusInternalServerError)
+		return nil, a.errorHandler.HandleError("internal server error", http.StatusInternalServerError)
 	}
 
 	if user == nil {
-		return nil, errors.NewError("unauthorized", http.StatusUnauthorized)
+		return nil, a.errorHandler.HandleError("unauthorized", http.StatusUnauthorized)
 	}
 
-	err = a.passwordHasher.CompareHashAndPassword(user.Password, c.Password)
-	if err != nil {
-		return nil, errors.NewError("unauthorized", http.StatusUnauthorized)
+	if err := a.passwordHasher.CompareHashAndPassword(user.Password, credentials.Password); err != nil {
+		return nil, a.errorHandler.HandleError("unauthorized", http.StatusUnauthorized)
 	}
 
-	return user, nil
+	return &User{
+		ID:       user.ID,
+		Username: user.Username,
+		Status:   user.Status,
+		Password: user.Password,
+	}, nil
+}
+
+func (a *authControllerImpl) getUser(username string) (*model.User, error) {
+	return a.userRepository.GetUser(username)
+}
+
+type errorHandlerImpl struct{}
+
+func NewErrorHandler() ErrorHandlerInterface {
+	return &errorHandlerImpl{}
+}
+
+func (e *errorHandlerImpl) HandleError(message string, code int) error {
+	return errors.NewError(message, code)
 }

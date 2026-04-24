@@ -158,10 +158,8 @@ dependencies = [
 
 ## `/test_request.py`
 ```python
-from langchain_core import output_parsers
 import sys
 from dotenv import load_dotenv
-import asyncio
 
 load_dotenv()
 
@@ -170,24 +168,34 @@ from graph.builder import app
 
 print("\n[START] Starting Simulated PR Review Pipeline...")
 
-TEST_FILE_PATH = "test_files/login.tsx"
-REPO_NAME = "frontend_pandhi"
+import os
+
+MOCK_DIR = "test_apps/backend_login_go"
+REPO_NAME = "backend_pandhi"
+
+current_files = {}
 
 try:
-    with open(TEST_FILE_PATH, "r", encoding="utf-8") as f:
-        code_content = f.read()
+    for root, dirs, files in os.walk(MOCK_DIR):
+        for file in files:
+            if file.endswith(".go"):
+                filepath = os.path.join(root, file)
+                # Normalize path separators for dict keys
+                normalized_path = filepath.replace("\\", "/")
+                with open(filepath, "r", encoding="utf-8") as f:
+                    current_files[normalized_path] = f.read()
 except Exception as e:
-    print(f"Error reading {TEST_FILE_PATH}: {e}")
+    print(f"Error reading mock directory {MOCK_DIR}: {e}")
     sys.exit(1)
 
 # This initial state mimics what the webhook + Celery worker would pass in
 initial_state = {
     "pr_url": f"https://github.com/fake/{REPO_NAME}/pull/1",
-    # Here we simulate an incoming piece of code
-    "current_code": code_content,
+    # The production source code to be reviewed (multi-file)
+    "current_files": current_files,
     "iteration_count": 0,
     "ast_is_valid": True,
-    # 🔑 This is the key piece! We tell the agents which vector store repo to query:
+    # Tells the Architect agent which vector store repo to query
     "repo_name": REPO_NAME,
     "domain_approvals": {
         "security": "pending",
@@ -206,6 +214,14 @@ print(f"[TEST] Simulating an incoming pull request for repository: {initial_stat
 for output in app.stream(initial_state):
     for node_name, result in output.items():
         print(f"\n[OK] {node_name} Finished Processing.")
+
+        print("---------------------------------------------------------------------")
+        print()
+        print(result)
+        print()
+        print("***********************************************************************")
+        print()
+        print()
         
 print("\n[DONE] Full testing simulation complete!")
 ```
@@ -259,7 +275,8 @@ arch_llm = ChatOpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1",
     model="llama-3.3-70b-versatile",
-    max_tokens=3000
+    max_tokens=3000,
+    temperature=0.0
 )
 
 # High-quality reviewer: complex backend logic analysis
@@ -267,7 +284,8 @@ review_llm_70b = ChatOpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1",
     model="llama-3.3-70b-versatile",
-    max_tokens=300
+    max_tokens=300,
+    temperature=0.0
 )
 
 # Fast reviewer: universal rule-based checks (security, quality, frontend)
@@ -276,7 +294,8 @@ review_llm_8b = ChatOpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1",
     model="llama-3.1-8b-instant",
-    max_tokens=300
+    max_tokens=300,
+    temperature=0.0
 )
 
 # QA Agent: separate token bucket from 70b model
@@ -284,7 +303,8 @@ review_llm_scout = ChatOpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1",
     model="meta-llama/llama-4-scout-17b-16e-instruct",
-    max_tokens=300
+    max_tokens=300,
+    temperature=0.0
 )
 
 # =============================================================================
@@ -299,6 +319,8 @@ class SpecialistReview:
 
 def invoke_strict(messages, llm_instance, max_retries=3):
     """Invokes the chosen LLM and parses the TOON format response."""
+    current_messages = list(messages)  # Copy so we don't mutate the caller's list
+    
     for attempt in range(max_retries):
         try:
             time.sleep(3)  # Prevent rate-limit bursting
@@ -307,7 +329,7 @@ def invoke_strict(messages, llm_instance, max_retries=3):
                 "vote: [APPROVE or REJECT]\n"
                 "critique: [your findings here, 1 string only, or empty if approved]"
             )
-            new_messages = messages + [HumanMessage(content=instructions)]
+            new_messages = current_messages + [HumanMessage(content=instructions)]
             res = llm_instance.invoke(new_messages)
 
             content = res.content.strip()
@@ -338,7 +360,18 @@ def invoke_strict(messages, llm_instance, max_retries=3):
                 elif line.strip() and not critique and not line.lower().startswith("vote:"):
                     critique += line.strip() + " "
 
-            return SpecialistReview(vote=vote, critique=critique.strip())
+            critique = critique.strip()
+
+            # Prevent 8b agent laziness: if it rejects, it MUST provide an actionable critique
+            if vote == "rejected" and (not critique or critique.lower() in ["reject", "rejected"]):
+                print(f"      (Attempt {attempt+1}) Agent rejected without providing a reason. Forcing retry...")
+                # Append the bad response and a strict warning to the history 
+                # so the 0.0 temperature LLM gets a different prompt next time!
+                current_messages.append(res)
+                current_messages.append(HumanMessage(content="You rejected the code but provided no explanation. You MUST provide a specific, actionable critique formatted as '[CATEGORY] file:line — finding'. Do not just say 'REJECT'. Try again."))
+                continue
+
+            return SpecialistReview(vote=vote, critique=critique)
 
         except Exception as e:
             if attempt == max_retries - 1:
@@ -380,6 +413,15 @@ def safe_print_critique(critique: str):
     safe_str = critique.encode("ascii", errors="replace").decode("ascii")
     print(f"   -> Critique: {safe_str}")
 
+def format_files_for_llm(files_dict) -> str:
+    if not isinstance(files_dict, dict):
+        return str(files_dict)
+    
+    formatted = ""
+    for filepath, content in files_dict.items():
+        formatted += f"\n--- FILE: {filepath} ---\n{content}\n"
+    return formatted.strip()
+
 
 # =============================================================================
 # AGENT NODES
@@ -399,7 +441,7 @@ def security_agent_node(state: AgentState):
     time.sleep(2)
     print(" Security Agent: Scanning code for vulnerabilities...")
 
-    code = state.get("current_code", "")
+    code = format_files_for_llm(state.get("current_files", {}))
     messages = [
         SystemMessage(content=SECURITY_AGENT_PROMPT),
         HumanMessage(content=f"Review this pull request code for security vulnerabilities:\n\n{code}")
@@ -435,7 +477,7 @@ def architecture_agent_node(state: AgentState):
     time.sleep(2)
     print(" Architecture Agent: Checking structural design (with codebase context)...")
 
-    code = state.get("current_code", "")
+    code = format_files_for_llm(state.get("current_files", {}))
     repo_name = state.get("repo_name", "")
     cached_context = state.get("arch_codebase_context", "")
 
@@ -514,14 +556,39 @@ def backend_analyst_node(state: AgentState):
         leak patterns, incorrect HTTP status codes, error handling.
         These are universal backend patterns — no codebase comparison needed.
         Uses the 70b model for its superior reasoning on complex logic.
+
+    Fix #2 — UAC Injection:
+        If a uac_context is present in state (from the PR description or Jira
+        ticket), it is prepended to the code review prompt. This lets the
+        analyst verify that the code actually implements the right feature,
+        not just that it is syntactically correct.
     """
     time.sleep(2)
+    repo_name = state.get("repo_name", "").lower()
+    
+    # CROSS-DISCIPLINE REVIEW: 
+    # Backend devs already wrote backend code, so the Backend Agent shouldn't review it.
+    if "backend" in repo_name:
+        print(" Backend Analyst: Skipping backend repo (Cross-discipline review paradigm).")
+        return {
+            "domain_approvals": {"backend": "approved"},
+            "active_critiques": []
+        }
+        
     print(" Backend Analyst: Checking functional logic and efficiency...")
 
-    code = state.get("current_code", "")
+    code = format_files_for_llm(state.get("current_files", {}))
+    uac_context = state.get("uac_context", "").strip()
+
+    uac_block = (
+        f"User Acceptance Criteria (UAC):\n{uac_context}\n\n"
+        "Verify that the code below implements exactly what the UAC describes.\n"
+        "A feature mismatch is a CRITICAL logic flaw — REJECT immediately.\n\n"
+    ) if uac_context else ""
+
     messages = [
         SystemMessage(content=BACKEND_ANALYST_AGENT_PROMPT),
-        HumanMessage(content=code)
+        HumanMessage(content=f"{uac_block}Review this code for functional logic issues:\n\n{code}")
     ]
     ai_review = invoke_strict(messages, review_llm_70b)
 
@@ -547,7 +614,7 @@ def code_quality_agent_node(state: AgentState):
     time.sleep(2)
     print(" Code Quality Agent: Checking for clean code...")
 
-    code = state.get("current_code", "")
+    code = format_files_for_llm(state.get("current_files", {}))
     messages = [
         SystemMessage(content=CODE_QUALITY_AGENT_PROMPT),
         HumanMessage(content=code)
@@ -572,14 +639,27 @@ def qa_agent_node(state: AgentState):
         Are interfaces abstracted? Is there input validation? These are
         universal testability patterns checked against the PR code alone.
         Uses Llama-4-Scout which has a separate 500K TPD bucket.
+
+    Fix #2 — UAC Injection:
+        If a uac_context is provided, the QA agent is also asked to verify
+        that existing tests explicitly cover the acceptance scenarios defined
+        in the UAC — not just generic branch coverage.
     """
     time.sleep(2)
     print(" QA Agent: Checking testability and mocks...")
 
-    code = state.get("current_code", "")
+    code = format_files_for_llm(state.get("current_files", {}))
+    uac_context = state.get("uac_context", "").strip()
+
+    uac_block = (
+        f"User Acceptance Criteria (UAC):\n{uac_context}\n\n"
+        "Also verify that the test suite contains at least one test case \n"
+        "that validates each UAC scenario above. Missing UAC coverage = REJECT.\n\n"
+    ) if uac_context else ""
+
     messages = [
         SystemMessage(content=QA_AGENT_PROMPT),
-        HumanMessage(content=code)
+        HumanMessage(content=f"{uac_block}{code}")
     ]
     ai_review = invoke_strict(messages, review_llm_scout)
 
@@ -605,9 +685,20 @@ def frontend_agent_node(state: AgentState):
         Uses the fast 8b model for quick verdict.
     """
     time.sleep(2)
+    repo_name = state.get("repo_name", "").lower()
+    
+    # CROSS-DISCIPLINE REVIEW: 
+    # Frontend devs already wrote frontend code, so the Frontend Agent shouldn't review it.
+    if "frontend" in repo_name:
+        print(" Frontend Agent: Skipping frontend repo (Cross-discipline review paradigm).")
+        return {
+            "domain_approvals": {"frontend": "approved"},
+            "active_critiques": []
+        }
+
     print(" Frontend Agent: Checking API contract and formatting...")
 
-    code = state.get("current_code", "")
+    code = format_files_for_llm(state.get("current_files", {}))
     messages = [
         SystemMessage(content=FRONTEND_AGENT_PROMPT),
         HumanMessage(content=code)
@@ -634,7 +725,7 @@ def development_agent_node(state: AgentState):
     time.sleep(2)
     print("Development Agent: Rewriting the code to fix issues...")
 
-    broken_code = state.get("current_code", "")
+    broken_code = format_files_for_llm(state.get("current_files", {}))
     current_count = state.get("iteration_count", 0)
     critique_log = state.get("active_critiques", [])
 
@@ -643,10 +734,8 @@ def development_agent_node(state: AgentState):
     human_content = (
         f"Feedback from all reviewers:\n{chr(10).join(critique_log)}\n\n"
         f"{warning_text}"
-        f"Please fix this code:\n\n{broken_code}\n\n"
-        "CRITICAL: Output ONLY the raw source code as plain text. "
-        "Do NOT use any tool calls, function calls, or JSON wrappers. "
-        "Your entire response must be executable source code and nothing else."
+        f"Please fix this codebase:\n\n{broken_code}\n\n"
+        "CRITICAL: First provide your CHECKLIST, then provide the full rewritten source code enclosed in triple backticks for each file you modify. DO NOT wrap the entire response in a single block, but use [FILE: path] followed by a backtick block for EACH file. Do not use any tool calls or wrappers."
     )
     messages = [
         SystemMessage(content=DEV_AGENT_PROMPT),
@@ -657,24 +746,52 @@ def development_agent_node(state: AgentState):
     response = invoke_with_retry(arch_llm, messages)
 
     new_code = response.content
+    checklist = ""
+    
+    # Parse multi-file output: Look for [FILE: path] and ``` blocks
+    import re
+    # We first extract checklist - anything before the first [FILE:
+    parts = new_code.split("[FILE:", 1)
+    if len(parts) > 1:
+        checklist = parts[0].strip()
+        file_content_part = "[FILE:" + parts[1]
+    else:
+        file_content_part = new_code
+    
+    if checklist:
+        safe_checklist = checklist.encode("ascii", errors="replace").decode("ascii")
+        print(f"\n   -> Verification Checklist:\n{safe_checklist}\n")
 
-    # Strip markdown fences if the LLM wrapped code in ```
-    if "```" in new_code:
-        parts = new_code.split("```")
-        if len(parts) >= 3:
-            content = parts[1]
-            lines = content.split("\n")
-            if lines and not lines[0].strip().startswith(" "):
-                content = "\n".join(lines[1:])
-            new_code = content.strip()
-
-    safe_code = new_code.encode("ascii", errors="replace").decode("ascii")
-    print(f"   -> Wrote new code:\n{safe_code}\n")
+    current_files = state.get("current_files", {})
+    file_blocks = re.findall(r"\[FILE:\s*(.*?)\s*\]\n*(?:```[\w]*\n)?(.*?)```", file_content_part, re.DOTALL)
+    
+    for filepath, file_content in file_blocks:
+        filepath = filepath.strip()
+        # Remove trailing/leading newlines from code if any
+        file_content = file_content.strip()
+        
+        # Write to state dict
+        current_files[filepath] = file_content
+        
+        # Physical write to disk
+        try:
+            # Create directories if they don't exist
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(file_content)
+            print(f"   -> Overwrote local file: {filepath}")
+        except Exception as e:
+            print(f"   -> [WARNING] Failed to write local file {filepath}: {e}")
 
     return {
-        "current_code": new_code,
+        "current_files": current_files,
         "iteration_count": current_count + 1,
         "ast_is_valid": True,
+        # Fix #1: Wipe short-term critique memory HERE, AFTER the Dev Agent has
+        # read and consumed it. consensus_node archives them to full_history
+        # first; we clear the short-term store so the next round of review
+        # agents start with a clean slate.
+        "active_critiques": [],
         "domain_approvals": {
             "backend": "pending",
             "security": "pending",
@@ -684,6 +801,28 @@ def development_agent_node(state: AgentState):
             "frontend": "pending"
         },
     }
+
+
+def _condense_history(full_log: list, max_entries: int = 12, max_chars_per_entry: int = 120) -> str:
+    """
+    Fix #4 — Doc Agent Token Bloat.
+
+    Produces a tight timeline string from the full critique history:
+      - Only keeps the last `max_entries` entries (default 12) to stay well
+        inside the 70b model's usable context window.
+      - Truncates any single entry that exceeds `max_chars_per_entry` chars
+        (e.g., large code snippets accidentally captured in a critique).
+
+    This replaces the raw `full_log[-18:]` slice that was passed verbatim,
+    which could exceed the context window on longer pipelines.
+    """
+    condensed = []
+    for entry in full_log[-max_entries:]:
+        if len(entry) > max_chars_per_entry:
+            condensed.append(entry[:max_chars_per_entry] + " […truncated]")
+        else:
+            condensed.append(entry)
+    return "\n".join(condensed) if condensed else "(no history recorded)"
 
 
 def documentation_summarizer_node(state: AgentState):
@@ -698,7 +837,8 @@ def documentation_summarizer_node(state: AgentState):
     print("Doc Agent: Summarizing the journey and saving the report...")
 
     full_log = state.get("full_history", [])
-    final_code = state.get("current_code", "")
+    files_dict = state.get("current_files", {})
+    final_code = format_files_for_llm(files_dict)
     final_votes = state.get("domain_approvals", {})
     iteration_count = state.get("iteration_count", 0)
 
@@ -750,10 +890,20 @@ def documentation_summarizer_node(state: AgentState):
     # -----------------------------------------------------------------------
     # Compose the human message with all structured data blocks
     # -----------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Fix #4: Condense the history before building the human message.
+    # _condense_history() trims the log to max 12 entries, each capped at
+    # 120 chars, so the Doc Agent gets a tight timeline rather than a
+    # potentially massive blob of verbose critiques or code snippets.
+    # -----------------------------------------------------------------------
+    condensed_history = _condense_history(full_log)
+    requires_human_review = state.get("requires_human_review", False)
+
     human_content = (
         f"VERDICTS:\n{verdicts_table}\n\n"
         f"FINAL_CRITIQUES:\n{final_critiques_block}\n\n"
-        f"HISTORY (summarized critique log):\n{chr(10).join(full_log[-18:])}\n\n"  # Last 18 entries max
+        f"HISTORY (condensed timeline):\n{condensed_history}\n\n"
+        f"REQUIRES_HUMAN_REVIEW: {requires_human_review}\n\n"
         f"FINAL_CODE:\n{final_code}"
     )
 
@@ -1030,7 +1180,17 @@ BACKEND_ANALYST_AGENT_PROMPT = """
 You are a Senior Backend Systems Analyst reviewing a pull request.
 Scope: functional logic flaws, resource management, efficiency bottlenecks, API contract violations.
 You are an analyst — do NOT rewrite code or suggest features.
+CRITICAL: Do NOT flag security issues (e.g., hardcoded secrets, weak hashes, SQL injection). The Security Agent owns this completely. Ensure you STRICTLY analyse only functional logic and efficiency.
 </role>
+
+<uac_gate>
+If a User Acceptance Criteria (UAC) block is provided at the start of the message:
+  - Your PRIMARY check is: does this code implement what the UAC specifies?
+  - If the code implements a DIFFERENT feature than what the UAC describes, REJECT immediately.
+  - A feature mismatch is classified as [CRITICAL] regardless of code quality.
+  - Format: [CRITICAL] — UAC mismatch: code implements X, UAC requires Y
+If no UAC block is present, skip this gate and proceed to the review checklist.
+</uac_gate>
 
 <review_checklist>
 Check for:
@@ -1164,42 +1324,70 @@ No intro text. No closing text.
 # PURPOSE  : Ensure code is testable, validated, and handles edge cases.
 # TRIGGERS : Call in parallel with ARCHITECT agent (Phase 1).
 # OUTPUT   : APPROVE or REJECT + critique log.
-
 QA_AGENT_PROMPT = """
 <role>
 You are a Senior SDET (Software Development Engineer in Test).
-Scope: testability, edge case handling, mockability, input validation.
+Scope: test coverage adequacy, testability, edge case handling, mockability, input validation.
 Do not flag security issues or architectural patterns — other agents own those.
 </role>
 
+<uac_gate>
+If a User Acceptance Criteria (UAC) block is provided at the start of the message:
+  - Check that the test suite contains at least one test case for EACH UAC scenario.
+  - If any UAC acceptance scenario has no corresponding test, REJECT immediately.
+  - Format: [UAC] missing test for: [scenario name from UAC]
+  - This check takes priority over the coverage gate below.
+If no UAC block is present, skip this gate and proceed to the coverage gate.
+</uac_gate>
+
+<test_coverage_gate>
+You will receive TWO code blocks:
+  1. SOURCE CODE — the production implementation (e.g., login.go)
+  2. TEST CODE   — the unit test file (e.g., login_test.go)
+
+Your PRIMARY job is to estimate the unit test coverage percentage by:
+  - Counting the distinct logical branches in the SOURCE CODE
+    (each if/else branch, each return path, each error case = 1 branch).
+  - Counting how many of those branches have at least one test case in the TEST CODE.
+  - Estimated coverage = (covered branches / total branches) × 100
+
+Coverage Gate (STRICT — no exceptions):
+  - coverage < 70%  → REJECT  (reason: COVERAGE_LOW)
+  - coverage > 80%  → REJECT  (reason: COVERAGE_HIGH — over-tested / gold-plating)
+  - 70% ≤ coverage ≤ 80% → APPROVE
+
+Show your branch count reasoning in the critique field so it is auditable.
+</test_coverage_gate>
+
 <review_checklist>
-Check for:
+Also check for:
   - Untestable functions — no dependency injection, hidden global state
   - External calls (DB, HTTP, file I/O) not abstracted behind an interface
-  - Missing null / empty / boundary input handling
+  - Missing null / empty / boundary input handling in tests
   - No guard against invalid types or malformed payloads
   - Functions doing too much to be unit-tested in isolation
-  - Missing error propagation — swallowed exceptions hide failures
   - Non-deterministic logic (random, time, env) not injectable for tests
-  - Missing return type clarity making assertions ambiguous
 </review_checklist>
 
 <output_rules>
 Verdict line: APPROVE or REJECT — one word, first line.
 
 Critique log (REJECT only):
-  - Max 5 lines. Max 10 words per line. Zero filler words.
+  - Line 1: [COVERAGE] estimated X% — reason (LOW, HIGH, or OK)
+  - Line 2-5: Max 10 words per line. Zero filler words.
   - Format: [CATEGORY] file:line — finding
-  - Categories: TESTABILITY | EDGE_CASE | MOCK | VALIDATION | RELIABILITY
+  - Categories: COVERAGE | TESTABILITY | EDGE_CASE | MOCK | VALIDATION | UAC
 
 No intro text. No closing text.
 </output_rules>
 
 <behavior>
-- Flag issues that would make CI tests brittle, flaky, or impossible to write.
-- If APPROVE: output only "APPROVE" with no other text.
+- If coverage is within 70–80%: output only "APPROVE" with no other text.
+- If outside the gate: REJECT and clearly state the estimated coverage % and direction.
+- Be precise. Count branches, do not guess.
 </behavior>
 """
+
 
 
 # 6. CODE QUALITY AGENT
@@ -1254,71 +1442,95 @@ No intro text. No closing text.
 # INPUT    : Original code + combined critique log from all rejecting agents.
 # OUTPUT   : Raw Python only. No markdown. No commentary.
 
+# DEV_AGENT_PROMPT = """
+# <role>
+# You are an Expert Senior Backend Developer.
+# Your PR was rejected by one or more specialist agents (Security, Backend, Frontend, Architect, QA, Quality).
+# Fix every issue in the critique log. Make no other changes.
+# </role>
+
+# <fix_guidelines>
+# Security fixes:
+#   - Passwords       → bcrypt or argon2 hash; never store plaintext
+#   - Secrets         → os.environ.get() or secrets manager; never hardcode
+#   - DB queries      → parameterized queries only; no string concatenation
+#   - Auth checks     → validate on every protected route; no bypasses
+#   - Error messages  → generic to caller; log detail server-side only
+#   - Input           → validate and sanitize all untrusted data at entry point
+#   - Deserialization → use safe parsers; never eval() or pickle untrusted input
+#   - TLS/defaults    → enforce TLS; set secure=True; disable debug in production
+
+# Backend fixes:
+#   - Logic flaws     → fix business logic to match stated goal exactly
+#   - Resources       → close connections, files, and streams in finally or context managers
+#   - Efficiency      → replace N+1 patterns; use batch queries or caching where flagged
+#   - API contracts   → return correct status codes and field names per spec
+
+# Frontend/API fixes:
+#   - Response schema → include all required fields (id, status, created_at, error_message)
+#   - Error format    → return {"error": {"code": N, "error_message": "..."}} always
+#   - Null handling   → explicitly set nullable fields to null; never omit them
+#   - Status codes    → 404 not found, 422 validation, 400 bad request; no generic 200/500
+
+# Architecture fixes:
+#   - Coupling        → inject dependencies; do not instantiate services directly
+#   - SRP             → split God objects into focused, single-responsibility classes
+#   - Abstraction     → move business logic out of handlers and models
+
+# QA fixes:
+#   - Testability     → inject external dependencies (DB, HTTP, time) via parameters
+#   - Edge cases      → add null, empty, and boundary checks at function entry
+#   - Mocking         → abstract all external calls behind an interface or callable
+
+# Quality fixes:
+#   - Naming          → replace vague names with descriptive snake_case identifiers
+#   - Docstrings      → add to all public functions, classes, and modules
+#   - Complexity      → extract deeply nested blocks into named helper functions
+#   - Dead code       → remove unused imports and unreachable logic
+# </fix_guidelines>
+
+# <constraints>
+# - Implement a real, complete fix for every line in the critique log.
+# - Do not add features, refactor unrelated code, or change function signatures.
+# - Return raw source code in its original language only.
+# - No markdown fences. No explanatory comments about the fix. No preamble or closing text.
+# - FORBIDDEN: Never use placeholder comments like "# rest of code here",
+#   "# ... existing code ...", "# TODO", "# implement later", or "// ...".
+#   Every function must be fully implemented with real, working code.
+# - Your entire response must be valid, executable code.
+# </constraints>
+
+# <input_format>
+# You will receive:
+#   CRITIQUE LOG: [combined output from all rejecting agents]
+#   ORIGINAL CODE: [code block]
+# </input_format>
+# """
+
 DEV_AGENT_PROMPT = """
-<role>
-You are an Expert Senior Backend Developer.
-Your PR was rejected by one or more specialist agents (Security, Backend, Frontend, Architect, QA, Quality).
-Fix every issue in the critique log. Make no other changes.
-</role>
+[ROLE] You are an expert Senior Backend Developer.
+Your job is to write secure, clean, and functional code that resolves all critiques provided by the analyst agents.
 
-<fix_guidelines>
-Security fixes:
-  - Passwords       → bcrypt or argon2 hash; never store plaintext
-  - Secrets         → os.environ.get() or secrets manager; never hardcode
-  - DB queries      → parameterized queries only; no string concatenation
-  - Auth checks     → validate on every protected route; no bypasses
-  - Error messages  → generic to caller; log detail server-side only
-  - Input           → validate and sanitize all untrusted data at entry point
-  - Deserialization → use safe parsers; never eval() or pickle untrusted input
-  - TLS/defaults    → enforce TLS; set secure=True; disable debug in production
+[CONTEXT] You submitted a pull request containing MULTIPLE files, but the analysts rejected it. 
+You need to rewrite the specific files that need fixes based on the critique log.
 
-Backend fixes:
-  - Logic flaws     → fix business logic to match stated goal exactly
-  - Resources       → close connections, files, and streams in finally or context managers
-  - Efficiency      → replace N+1 patterns; use batch queries or caching where flagged
-  - API contracts   → return correct status codes and field names per spec
+[INSTRUCTIONS]
+You MUST follow a 2-step process to ensure all critiques are fixed.
+STEP 1: Write a brief checklist explaining how you are fixing EACH issue in the critique log. Format this as a list starting underneath "CHECKLIST:"
+STEP 2: Output the complete, fixed source code for EVERY file you modify. 
+You MUST demarcate each file using the exact format:
+[FILE: path/to/file.go]
+```go
+<entire new file content>
+```
+(Repeat for every file you need to modify).
+DO NOT output files that do not need changes.
 
-Frontend/API fixes:
-  - Response schema → include all required fields (id, status, created_at, error_message)
-  - Error format    → return {"error": {"code": N, "error_message": "..."}} always
-  - Null handling   → explicitly set nullable fields to null; never omit them
-  - Status codes    → 404 not found, 422 validation, 400 bad request; no generic 200/500
-
-Architecture fixes:
-  - Coupling        → inject dependencies; do not instantiate services directly
-  - SRP             → split God objects into focused, single-responsibility classes
-  - Abstraction     → move business logic out of handlers and models
-
-QA fixes:
-  - Testability     → inject external dependencies (DB, HTTP, time) via parameters
-  - Edge cases      → add null, empty, and boundary checks at function entry
-  - Mocking         → abstract all external calls behind an interface or callable
-
-Quality fixes:
-  - Naming          → replace vague names with descriptive snake_case identifiers
-  - Docstrings      → add to all public functions, classes, and modules
-  - Complexity      → extract deeply nested blocks into named helper functions
-  - Dead code       → remove unused imports and unreachable logic
-</fix_guidelines>
-
-<constraints>
-- Implement a real, complete fix for every line in the critique log.
-- Do not add features, refactor unrelated code, or change function signatures.
-- Return raw source code in its original language only.
-- No markdown fences. No explanatory comments about the fix. No preamble or closing text.
-- FORBIDDEN: Never use placeholder comments like "# rest of code here",
-  "# ... existing code ...", "# TODO", "# implement later", or "// ...".
-  Every function must be fully implemented with real, working code.
-- Your entire response must be valid, executable code.
-</constraints>
-
-<input_format>
-You will receive:
-  CRITIQUE LOG: [combined output from all rejecting agents]
-  ORIGINAL CODE: [code block]
-</input_format>
+[CONSTRAINTS]
+- Implement proper fixes for every critique log entry.
+- The ONLY text before the code blocks should be your checklist. No introductory preamble.
+- FORBIDDEN: You must NEVER use placeholder comments like '# rest of code here', '# ... existing code ...', '# TODO', '# implement later', '// ...'. Every function and method MUST be fully implemented with real, working code.
 """
-
 
 # 8. DOCUMENTATION AGENT
 # -----------------------------------------------------------------------------
@@ -1330,7 +1542,7 @@ You will receive:
 DOC_AGENT_PROMPT = """
 <role>
 You are a Technical Documentation Specialist.
-You will receive structured data blocks: VERDICTS, FINAL_CRITIQUES, HISTORY, and FINAL_CODE.
+You will receive structured data blocks: VERDICTS, FINAL_CRITIQUES, HISTORY, REQUIRES_HUMAN_REVIEW, and FINAL_CODE.
 Your job is to write a polished Markdown PR review report using that data.
 </role>
 
@@ -1359,8 +1571,9 @@ Your job is to write a polished Markdown PR review report using that data.
 ```
 
 ## Sign-Off
-[If ALL verdicts are APPROVE: write "All agents approved. Safe to merge."]
-[If ANY verdict is REJECT: write "Pipeline failed to converge. Manual review required."]
+[If REQUIRES_HUMAN_REVIEW is True: write "⚠️ Pipeline failed to converge after maximum iterations. A Senior Developer must review this PR manually before merging."]
+[If REQUIRES_HUMAN_REVIEW is False and ALL verdicts are APPROVE: write "✅ All agents approved. Safe to merge."]
+[If REQUIRES_HUMAN_REVIEW is False and ANY verdict is REJECT: write "❌ Pipeline failed to converge. Manual review required."]
 
 ### Final Agent Verdicts & Reasons
 [COPY the FINAL_CRITIQUES block verbatim. One bullet per agent.]
@@ -1371,6 +1584,7 @@ Your job is to write a polished Markdown PR review report using that data.
 - NEVER change any APPROVE/REJECT values — they are computed facts, not your opinion.
 - Code block must use ```go fencing.
 - Summarize iteration history in short paragraphs only. Do not list every critique.
+- REQUIRES_HUMAN_REVIEW is a boolean flag from the pipeline state. Reflect it accurately in the Sign-Off.
 </constraints>
 """
 
@@ -2152,19 +2366,49 @@ def environment_sandbox_node(state: AgentState):
 
 
 # -----------------------------
+# Human Fallback Node (Fix #3)
+# -----------------------------
+def human_fallback_node(state: AgentState):
+    """
+    Reached when the pipeline exhausts all 3 review iterations without
+    reaching consensus. Stamps `requires_human_review: True` in state so
+    that the webhook response / front-end dashboard can tag a Senior
+    Developer to step in. Then falls through to the Doc Agent which will
+    include the failure sign-off in its Markdown report.
+    """
+    print(" [FALLBACK] Iteration limit reached. Escalating to human reviewer.")
+    print("   -> Setting requires_human_review = True in pipeline state.")
+    return {"requires_human_review": True}
+
+
+# -----------------------------
 #  NEW: Consensus Node (FAN-IN)
 # -----------------------------
 def consensus_node(state: AgentState):
+    """
+    Fan-in point — collects all specialist votes.
+
+    Fix #1 — Memory Wipe Bug:
+        active_critiques are NO LONGER wiped here. The Developer Agent is
+        the consumer of these critiques; it must read them BEFORE they are
+        cleared. Wiping here caused the Dev Agent to receive an empty log
+        on Round 2, creating an infinite failure loop.
+
+        The wipe now happens inside development_agent_node, after it copies
+        the critiques into the human message. full_history is still
+        accumulated here so the Doc Agent has the complete journey.
+    """
     votes = state.get("domain_approvals", {})
     print(f" Consensus Node: All agents finished.")
     print(f" Votes: {votes}")
 
     if any(vote == "rejected" for vote in votes.values()):
         current_critiques = state.get("active_critiques", [])
-        print(f" → {len(current_critiques)} critiques moving to long-term history. Wiping short-term.")
+        print(f" → {len(current_critiques)} critiques archived to full_history. Preserved for Dev Agent.")
         return {
-            "full_history": current_critiques,  # Appends to long-term memory
-            "active_critiques": [],             # WIPES short-term for next round
+            "full_history": current_critiques,  # Append to long-term memory
+            # ✅ active_critiques NOT wiped here — Dev Agent reads them first,
+            #    then wipes them in its own return dict.
         }
     return {}
 
@@ -2188,6 +2432,7 @@ workflow.add_node("frontend_agent_node", frontend_agent_node)
 
 workflow.add_node("consensus_node", consensus_node)
 
+workflow.add_node("human_fallback_node", human_fallback_node)
 workflow.add_node("documentation_summarizer_node", documentation_summarizer_node)
 workflow.add_node("environment_sandbox_node", environment_sandbox_node)
 
@@ -2219,6 +2464,7 @@ workflow.add_edge("frontend_agent_node", "consensus_node")
 # -----------------------------
 # Final Flow
 # -----------------------------
+workflow.add_edge("human_fallback_node", "documentation_summarizer_node")
 workflow.add_edge("environment_sandbox_node", "documentation_summarizer_node")
 workflow.add_edge("documentation_summarizer_node", END)
 
@@ -2258,22 +2504,24 @@ if __name__ == "__main__":
 from graph.state import AgentState
 
 def route_negotiation(state: AgentState):
-    
-    # Summarization Timeout
+
+    # ── Iteration Limit (Fix #3) ──────────────────────────────────────────────
+    # When 3 rounds pass without consensus, stamp the state as requiring human
+    # review before routing to the Documentation Agent for the failure report.
     if state.get("iteration_count", 0) >= 3:
-        return "documentation_summarizer_node"
-        
+        return "human_fallback_node"
+
     # Syntactic Failure
     if not state["ast_is_valid"]:
         return "development_agent_node"
-    
+
     # Consensus Reached
     if state.get("domain_approvals") and all(vote == "approved" for vote in state["domain_approvals"].values()):
         return "environment_sandbox_node"
-    
+
     if state.get("domain_approvals") and any(vote == "rejected" for vote in state["domain_approvals"].values()):
         return "development_agent_node"
-    
+
     # Fallback to development if approvals are somehow missing/invalid
     return "development_agent_node"
 ```
@@ -2306,7 +2554,7 @@ class AgentState(TypedDict):
     pr_url: str
     ado_ticket_id: str
     uac_context: str 
-    current_code: str
+    current_files: dict[str, str]
     repo_name: str          # The repo identifier used in vector store lookups
     
     # Smart Routing Flags
@@ -2329,6 +2577,9 @@ class AgentState(TypedDict):
     iteration_count: int
     requires_summarization: bool 
     tie_breaker_invoked: bool
+    # Set to True when the iteration limit (3 rounds) is hit without consensus.
+    # Signals the dashboard/webhook consumer to escalate to a human reviewer.
+    requires_human_review: bool
 
     # Codebase context cache: Architecture Agent fetches this ONCE in Round 1.
     # Subsequent rounds reuse it without re-querying ChromaDB.
