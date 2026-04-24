@@ -1,20 +1,17 @@
+// Package utils provides concrete utility implementations used across the stack.
 package utils
 
 import (
-	"crypto/rand"
-	"crypto/subtle"
-	"golang.org/x/crypto/argon2"
+	"backend_login_go/interfaces"
+
 	"golang.org/x/crypto/bcrypt"
 )
 
-type PasswordHasher interface {
-	HashPassword(password string) (string, error)
-	CompareHashAndPassword(hashedPassword string, password string) error
-}
-
 type passwordHasher struct{}
 
-func NewPasswordHasher() PasswordHasher {
+// NewPasswordHasher returns a bcrypt-backed password hasher that satisfies
+// interfaces.PasswordHasherInterface.
+func NewPasswordHasher() interfaces.PasswordHasherInterface {
 	return &passwordHasher{}
 }
 

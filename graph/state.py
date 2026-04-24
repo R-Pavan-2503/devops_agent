@@ -26,8 +26,10 @@ def bool_or(existing: bool, new: bool) -> bool:
 class AgentState(TypedDict):
     # Ingestion Inputs
     pr_url: str
+    pr_title: str           # PR title from webhook payload; used by router for bugfix detection
+    pr_body: str            # PR description from webhook payload; used by router for UAC hints
     ado_ticket_id: str
-    uac_context: str 
+    uac_context: str
     current_files: dict[str, str]
     repo_name: str          # The repo identifier used in vector store lookups
     

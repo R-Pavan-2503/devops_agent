@@ -1,18 +1,20 @@
 package controller
 
 import (
-	"backend_login_go/errors"
+	"backend_login_go/interfaces"
 	"backend_login_go/model"
 	"backend_login_go/repository"
-	"backend_login_go/utils"
-	"strings"
+	"backend_login_go/validation"
+	"net/http"
 )
 
+// Credentials holds the login credentials from the HTTP request body.
 type Credentials struct {
 	Username string
 	Password string
 }
 
+// User is the sanitised view of a model.User returned to the API layer.
 type User struct {
 	ID       string
 	Username string
@@ -20,33 +22,37 @@ type User struct {
 	Password string
 }
 
+// AuthController is the public interface for the auth business logic.
 type AuthController interface {
 	Authenticate(credentials Credentials) (*User, error)
 }
 
+// UserRepositoryInterface abstracts the data-access layer so the controller
+// can be tested without a real database connection.
 type UserRepositoryInterface interface {
 	GetUser(username string) (*model.User, error)
 }
 
-type PasswordHasherInterface interface {
-	CompareHashAndPassword(hashedPassword string, password string) error
-	HashPassword(password string) (string, error)
-}
-
-type ErrorHandlerInterface interface {
-	HandleError(message string, code int) error
-}
-
 type authControllerImpl struct {
-	userRepository UserRepositoryInterface
-	passwordHasher  PasswordHasherInterface
-	errorHandler   ErrorHandlerInterface
+	userRepository repository.UserRepository
+	passwordHasher interfaces.PasswordHasherInterface
+	errorHandler   interfaces.ErrorHandlerInterface
 }
 
-func NewAuthController(userRepository UserRepositoryInterface, passwordHasher PasswordHasherInterface, errorHandler ErrorHandlerInterface) AuthController {
-	return &authControllerImpl{userRepository: userRepository, passwordHasher: passwordHasher, errorHandler: errorHandler}
+// NewAuthController wires together the controller with its dependencies.
+func NewAuthController(
+	userRepository repository.UserRepository,
+	passwordHasher interfaces.PasswordHasherInterface,
+	errorHandler interfaces.ErrorHandlerInterface,
+) AuthController {
+	return &authControllerImpl{
+		userRepository: userRepository,
+		passwordHasher: passwordHasher,
+		errorHandler:   errorHandler,
+	}
 }
 
+// Authenticate validates credentials and returns the authenticated user or an error.
 func (a *authControllerImpl) Authenticate(credentials Credentials) (*User, error) {
 	if credentials.Username == "" || credentials.Password == "" {
 		return nil, a.errorHandler.HandleError("username and password are required", http.StatusBadRequest)
@@ -58,7 +64,7 @@ func (a *authControllerImpl) Authenticate(credentials Credentials) (*User, error
 		return nil, a.errorHandler.HandleError(err.Error(), http.StatusBadRequest)
 	}
 
-	user, err := a.getUser(credentials.Username)
+	user, err := a.userRepository.GetUser(credentials.Username)
 	if err != nil {
 		return nil, a.errorHandler.HandleError("internal server error", http.StatusInternalServerError)
 	}
@@ -79,16 +85,14 @@ func (a *authControllerImpl) Authenticate(credentials Credentials) (*User, error
 	}, nil
 }
 
-func (a *authControllerImpl) getUser(username string) (*model.User, error) {
-	return a.userRepository.GetUser(username)
-}
-
+// errorHandlerImpl is the production implementation of ErrorHandlerInterface.
 type errorHandlerImpl struct{}
 
-func NewErrorHandler() ErrorHandlerInterface {
+// NewErrorHandler creates a production-ready error handler.
+func NewErrorHandler() interfaces.ErrorHandlerInterface {
 	return &errorHandlerImpl{}
 }
 
 func (e *errorHandlerImpl) HandleError(message string, code int) error {
-	return errors.NewError(message, code)
+	return NewError(message, code)
 }

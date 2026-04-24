@@ -411,6 +411,10 @@ def teardown_workspace(workspace_path: str) -> None:
         logger.info("Workspace already gone (or never existed): %s", resolved)
         return
 
-    shutil.rmtree(resolved, ignore_errors=False)
+    def handle_remove_read_only(func, path, exc):
+        import stat
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    shutil.rmtree(resolved, onerror=handle_remove_read_only)
     _active_workspaces.discard(resolved)
     logger.info("Workspace torn down: %s", resolved)

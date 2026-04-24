@@ -4,30 +4,13 @@ graph/edges.py
 Routing logic for the multi-agent DevOps pipeline.
 
 Key routing decisions:
-  route_after_routing_node  — decides if QA runs or is skipped
-  route_negotiation         — post-consensus: dev agent, shadow env, or docs
-  route_after_shadow        — post-shadow: loop back or terminate
+  route_negotiation  — post-consensus: dev agent, shadow env, or docs
+  route_after_shadow — post-shadow: loop back to specialists or terminate
 """
 
 from graph.state import AgentState
 
 
-# ---------------------------------------------------------------------------
-# 1. Post-Router-Node: decide whether to include QA this round
-# ---------------------------------------------------------------------------
-
-def route_after_router(state: AgentState) -> str:
-    """
-    Called immediately after the PR-type router node.
-    If the PR has no test files, we skip the QA Agent entirely (saves tokens).
-    If it IS a bugfix/refactor with no UAC, Scrum Agent is already bypassed
-    upstream — this function handles the QA gate only.
-    """
-    if state.get("pr_has_tests", False):
-        return "backend_analyst_node"   # full pipeline including QA
-    else:
-        # Jump straight to specialist pipeline; QA node will self-skip via state flag
-        return "backend_analyst_node"   # same entry; QA node checks flag internally
 
 
 # ---------------------------------------------------------------------------
