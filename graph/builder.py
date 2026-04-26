@@ -72,18 +72,23 @@ def consensus_node(state: AgentState):
         them BEFORE they are cleared.
 
         The wipe happens inside development_agent_node, after the CRA
-        has already synthesized them into a master_directive. full_history
-        is still accumulated here so the Doc Agent has the complete journey.
+        has already synthesized them into a master_directive.
+
+    Fix #11 — Always persist critiques to full_history:
+        Previously critiques were only written to full_history on rejection.
+        Now ALL active_critiques are persisted regardless of vote outcome
+        so the doc agent accumulates the complete decision trail across rounds.
     """
     votes = state.get("domain_approvals", {})
     print(f" Consensus Node: All agents finished. Votes: {votes}")
 
-    if any(v == "rejected" for v in votes.values()):
-        current_critiques = state.get("active_critiques", [])
+    # Always persist the current round's critiques to long-term history,
+    # even if all agents approved (empty list is a valid historical record).
+    current_critiques = state.get("active_critiques", [])
+    if current_critiques:
         print(f" → {len(current_critiques)} critiques archived to full_history.")
-        return {"full_history": current_critiques}
 
-    return {}
+    return {"full_history": current_critiques}
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ import (
 )
 
 type LoginResponse struct {
-	ID        int    `json:"id"`
+	ID        string `json:"id"`
 	Username  string `json:"username"`
 	Status    string `json:"status"`
 	CreatedAt string `json:"created_at"`

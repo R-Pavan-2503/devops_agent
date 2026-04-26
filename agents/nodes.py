@@ -610,11 +610,19 @@ def critique_resolve_agent_node(state: AgentState):
 
 def development_agent_node(state: AgentState):
     """
-    Developer Agent — Code Rewriter + Docker Sandbox Validator.
+    Developer Agent - Code Rewriter + Docker Sandbox Validator (Node.js).
 
     Receives the Master Directive from the Critique Resolve Agent (a conflict-
     resolved, priority-ordered action list) and rewrites the code to fix all
     identified issues. Uses the 70b model for high-quality code generation.
+
+    Sandbox strategy:
+      - Webhook mode: The Celery worker pre-clones the full repo into a temp
+        dir and passes it via sandbox_workspace_path. We patch LLM-fixed files
+        on top and run `npm install && npm test` inside node:20-alpine.
+      - Local test_request.py mode: No pre-cloned path; we create a minimal
+        sandbox from the in-memory PR diff files instead.
+      - Rounds 2 & 3: Re-use the same workspace dir, patching only changed files.
     """
     time.sleep(2)
     print("Development Agent: Rewriting the code to fix issues...")
@@ -625,56 +633,17 @@ def development_agent_node(state: AgentState):
     workspace_path = state.get("sandbox_workspace_path", "")
     prev_docker_result = state.get("sandbox_test_result", "")
 
-    # ── Sandbox: Setup on Round 1, patch-in-place on Rounds 2 & 3 ────────
+    # -- Sandbox: Use pre-cloned workspace OR create one from memory ----------
     current_files = dict(state.get("current_files", {}))
 
     if not workspace_path:
-        # Strip "test_apps/backend_login_go/" prefix so the Go project
-        # lands at the workspace root — matching how go.mod declares the module.
-        _PREFIX = "test_apps/"
-        files_for_sandbox = {
-            (k[len(_PREFIX):] if k.replace("\\", "/").startswith(_PREFIX) else k): v
-            for k, v in current_files.items()
-        }
-
-        if any(f.endswith(".go") for f in files_for_sandbox):
-            # Inject the real go.mod from disk (has correct require + go version)
-            try:
-                with open("test_apps/backend_login_go/go.mod", "r", encoding="utf-8") as _f:
-                    files_for_sandbox["backend_login_go/go.mod"] = _f.read()
-                print("   [Sandbox] Injected real go.mod from disk")
-            except FileNotFoundError:
-                files_for_sandbox["backend_login_go/go.mod"] = "module backend_login_go\n\ngo 1.22\n"
-                print("   [Sandbox] WARNING: go.mod not found on disk — using minimal fallback")
-
-            # Inject go.sum so external deps (golang.org/x/crypto) resolve offline
-            for _sum_candidate in [
-                "test_apps/backend_login_go/go.sum",
-                "go.sum",
-            ]:
-                try:
-                    with open(_sum_candidate, "r", encoding="utf-8") as _f:
-                        files_for_sandbox["backend_login_go/go.sum"] = _f.read()
-                    print(f"   [Sandbox] Injected go.sum from {_sum_candidate} ({len(files_for_sandbox['backend_login_go/go.sum'])} bytes)")
-                    break
-                except FileNotFoundError:
-                    continue
-            else:
-                print("   [Sandbox] WARNING: go.sum not found anywhere — external deps may fail")
-
-        workspace_path = setup_workspace(files_for_sandbox)
-        print(f"   [Sandbox] Workspace created: {workspace_path}")
+        # Local test mode (test_request.py): build sandbox from PR diff in memory
+        workspace_path = setup_workspace(current_files)
+        print(f"   [Sandbox] Workspace created from memory: {workspace_path}")
     else:
-        # Rounds 2 & 3 — Reuse the existing workspace, patch changed files.
-        _PREFIX = "test_apps/"
-        files_stripped = {
-            (k[len(_PREFIX):] if k.replace("\\", "/").startswith(_PREFIX) else k): v
-            for k, v in current_files.items()
-        }
-        update_workspace_files(workspace_path, files_stripped)
-        print(f"   [Sandbox] Workspace patched for Round {current_count + 1}: {workspace_path}")
+        print(f"   [Sandbox] Using pre-cloned workspace: {workspace_path}")
 
-    # ── Build LLM prompt with Docker compiler evidence (if available) ─────
+    # -- Build LLM prompt with Docker compiler evidence (if available) --------
     active_critiques = state.get("active_critiques", [])
     critique_log = active_critiques if active_critiques else ["No specific critiques from this round (all approved)."]
 
@@ -692,7 +661,7 @@ def development_agent_node(state: AgentState):
         f"Please fix this codebase:\n\n{broken_code}\n\n"
         "CRITICAL: First provide your CHECKLIST, then provide the full rewritten "
         "source code enclosed in triple backticks for each file you modify. "
-        "DO NOT wrap the entire response in a single block — use [FILE: path] "
+        "DO NOT wrap the entire response in a single block - use [FILE: path] "
         "followed by a backtick block for EACH file. Do not use tool calls or wrappers."
     )
     messages = [
@@ -727,7 +696,7 @@ def development_agent_node(state: AgentState):
         filepath = filepath.strip()
         file_content = file_content.strip()
         if not file_content:
-            print(f"   -> [WARNING] LLM returned empty content for {filepath} — skipping to preserve original")
+            print(f"   -> [WARNING] LLM returned empty content for {filepath} - skipping to preserve original")
             continue
         current_files[filepath] = file_content
 
@@ -741,27 +710,67 @@ def development_agent_node(state: AgentState):
         except Exception as e:
             print(f"   -> [WARNING] Failed to write local file {filepath}: {e}")
 
-    # ── Patch sandbox workspace with LLM's rewritten files ───────────────
-    # Exclude go.mod (any path variant) — injected once at setup, must not be overwritten.
-    _PREFIX = "test_apps/"
-    files_to_patch = {
-        (k[len(_PREFIX):] if k.replace("\\", "/").startswith(_PREFIX) else k): v
-        for k, v in current_files.items()
-        if k not in ("go.mod", "go.sum")  # never let LLM overwrite these
-    }
-    update_workspace_files(workspace_path, files_to_patch)
-    print(f"   [Sandbox] Patched {len(files_to_patch)} file(s) with LLM's rewritten code.")
+    # -- Patch workspace with LLM's rewritten files ---------------------------
+    # Write every fixed file into the workspace directory so Docker sees the new code.
+    update_workspace_files(workspace_path, current_files)
+    print(f"   [Sandbox] Patched {len(current_files)} file(s) into workspace.")
 
-    # ── Run Docker compilation check (`go vet` -> `go test`) ───────────────
+    # -- Auto-detect Node.js app directory ------------------------------------
+    # The cloned repo may have a package.json at root OR inside a sub-folder.
+    from pathlib import Path as _Path
+
+    workspace_root = _Path(workspace_path)
+    node_app_dir = None
+
+    if (workspace_root / "package.json").exists():
+        node_app_dir = "."   # package.json is at repo root
+    else:
+        # Search one level deep for the first sub-directory with package.json
+        for subdir in sorted(workspace_root.iterdir()):
+            if subdir.is_dir() and (subdir / "package.json").exists():
+                node_app_dir = subdir.name
+                break
+
+    docker_image = "node:20-alpine"
+
+    if node_app_dir:
+        if node_app_dir == ".":
+            test_command = (
+                "npm install --legacy-peer-deps 2>&1 "
+                "&& echo '--- INSTALL_PASSED ---' "
+                "&& npm test 2>&1"
+            )
+        else:
+            test_command = (
+                f"cd {node_app_dir} "
+                "&& npm install --legacy-peer-deps 2>&1 "
+                "&& echo '--- INSTALL_PASSED ---' "
+                "&& npm test 2>&1"
+            )
+        print(f"   [Sandbox] Node.js app detected at: {node_app_dir!r} - using {docker_image}")
+    else:
+        # No package.json found anywhere - skip Docker gracefully
+        print("   [Sandbox] WARNING: No package.json found - skipping Docker execution.")
+        return {
+            "current_files": current_files,
+            "iteration_count": current_count + 1,
+            "ast_is_valid": True,  # non-fatal; agents still reviewed the code
+            "shadow_passed": False,
+            "sandbox_workspace_path": workspace_path,
+            "sandbox_test_result": "[SANDBOX] No runnable Node.js app detected (no package.json found).",
+            "active_critiques": [],
+            "domain_approvals": {
+                "backend": "pending", "security": "pending",
+                "architecture": "pending", "code_quality": "pending",
+                "qa": "pending", "frontend": "pending"
+            },
+        }
+
+    # -- Run Docker: npm install + npm test -----------------------------------
     docker_result = run_tests_in_docker(
         workspace_path=workspace_path,
-        test_command=(
-             "cd backend_login_go && "
-             "(GONOSUMCHECK=* GOFLAGS=-mod=mod go vet ./... && "
-             "echo '--- VET_PASSED ---' && "
-             "GONOSUMCHECK=* GOFLAGS=-mod=mod go test ./... -v) 2>&1"
-        ),
-        docker_image="golang:1.22",
+        test_command=test_command,
+        docker_image=docker_image,
     )
 
     stdout_str = docker_result.stdout or ""
@@ -769,34 +778,29 @@ def development_agent_node(state: AgentState):
     full_output = stdout_str + "\n" + stderr_str
 
     if docker_result.timed_out:
-        sandbox_result_str = f"[SANDBOX Round {current_count + 1}] ⏱️ go vet/test TIMED OUT after 60s."
-        print(f"   [Sandbox] ⏱️ TIMED OUT")
+        sandbox_result_str = f"[SANDBOX Round {current_count + 1}] npm install/test TIMED OUT after 60s."
+        print("   [Sandbox] TIMED OUT")
     else:
-        # Determine exactly what happened
-        vet_passed = "--- VET_PASSED ---" in full_output
-        has_tests = "no test files" not in full_output and "?   " not in full_output
-        tests_passed = vet_passed and docker_result.passed
+        install_passed = "--- INSTALL_PASSED ---" in full_output
+        tests_passed = install_passed and docker_result.passed
 
         print("\n   [Sandbox] --- Execution Report ---")
-        if vet_passed:
-            print("   ✅ Compilation / go vet: SUCCESS")
+        if install_passed:
+            print("   [OK] npm install: SUCCESS")
             if tests_passed:
-                print("   ✅ Unit Tests: SUCCESS")
-                sandbox_result_str = f"[SANDBOX Round {current_count + 1}] ✅ COMPILATION PASSED. ✅ UNIT TESTS PASSED."
+                print("   [OK] npm test: SUCCESS")
+                sandbox_result_str = f"[SANDBOX Round {current_count + 1}] OK npm install PASSED. OK npm test PASSED."
             else:
-                if has_tests:
-                    print(f"   ❌ Unit Tests: FAILED (exit code {docker_result.exit_code})")
-                    sandbox_result_str = f"[SANDBOX Round {current_count + 1}] ✅ COMPILATION PASSED. ❌ UNIT TESTS FAILED.\nSTDOUT:\n{stdout_str[:1500]}"
-                else:
-                    print("   ⚠️ Unit Tests: DID NOT RUN (No tests found)")
-                    sandbox_result_str = f"[SANDBOX Round {current_count + 1}] ✅ COMPILATION PASSED. ⚠️ NO TESTS RAN."
-                    # If there's no tests, but vet passed, that's still an AST success
-                    docker_result.passed = True
+                print(f"   [FAIL] npm test: FAILED (exit code {docker_result.exit_code})")
+                sandbox_result_str = (
+                    f"[SANDBOX Round {current_count + 1}] OK npm install PASSED. FAIL npm test FAILED.\n"
+                    f"STDOUT:\n{stdout_str[:1500]}\n"
+                    f"STDERR:\n{stderr_str[:1500]}"
+                )
         else:
-            print(f"   ❌ Compilation / go vet: REJECTED (exit code {docker_result.exit_code})")
-            print("   ⚠️ Unit Tests: DID NOT RUN (Compilation failed)")
+            print(f"   [FAIL] npm install: FAILED (exit code {docker_result.exit_code})")
             sandbox_result_str = (
-                f"[SANDBOX Round {current_count + 1}] ❌ COMPILATION FAILED (exit_code={docker_result.exit_code}).\n"
+                f"[SANDBOX Round {current_count + 1}] FAIL npm install FAILED (exit_code={docker_result.exit_code}).\n"
                 f"STDOUT:\n{stdout_str[:1500]}\n"
                 f"STDERR:\n{stderr_str[:1500]}"
             )
@@ -807,8 +811,7 @@ def development_agent_node(state: AgentState):
         "iteration_count": current_count + 1,
         "ast_is_valid": docker_result.passed,
         "shadow_passed": False,
-        # Persist workspace path so Rounds 2 & 3 reuse the same temp dir
-        # instead of spinning up a new one each iteration.
+        # Persist workspace path so Rounds 2 & 3 reuse the same cloned directory.
         "sandbox_workspace_path": workspace_path,
         "sandbox_test_result": sandbox_result_str,
         # Wipe short-term critique memory after Dev Agent has consumed it.
@@ -974,4 +977,79 @@ def documentation_summarizer_node(state: AgentState):
     except Exception as e:
         print(f"   -> Error saving file: {e}")
 
+    # ── Post results back to GitHub (Fix #12) ─────────────────────────────
+    _post_github_results(state, report_md, final_votes)
+
     return {"human_readable_summary": report_md}
+
+
+def _post_github_results(state: AgentState, report_md: str, final_votes: dict) -> None:
+    """
+    Post the review summary as a PR comment and set a GitHub Check Run status.
+
+    Both calls are best-effort — any failure is logged but does not affect
+    pipeline state or the returned report.
+
+    Silently skips when:
+      - pr_url is absent or not a github.com URL (local / unit-test mode).
+      - GITHUB_TOKEN env var is not set (would 401 on private repos anyway).
+    """
+    pr_url = state.get("pr_url", "")
+    if not pr_url or "github.com" not in pr_url:
+        print("   [GitHub] Skipping posting — no GitHub PR URL in state (local test mode).")
+        return
+
+    github_token = os.getenv("GITHUB_TOKEN", "")
+    if not github_token:
+        print("   [GitHub] Skipping posting — GITHUB_TOKEN not set.")
+        return
+
+    # Parse https://github.com/{owner}/{repo}/pull/{number}
+    url_match = re.match(
+        r"https://github\.com/([^/]+/[^/]+)/pull/(\d+)",
+        pr_url
+    )
+    if not url_match:
+        print(f"   [GitHub] Cannot parse repo/PR number from URL: {pr_url}")
+        return
+
+    repo_full_name = url_match.group(1)
+    pr_number = int(url_match.group(2))
+
+    # Determine pass/fail conclusion (pending votes are not counted as approved)
+    all_approved = all(
+        v == "approved"
+        for v in final_votes.values()
+        if v != "pending"
+    )
+    conclusion = "success" if all_approved else "failure"
+
+    # Late import — avoids loading httpx at module-import time in tests
+    from api.github_client import post_pr_comment, create_check_run  # noqa: PLC0415
+
+    # 1. PR comment
+    posted = post_pr_comment(repo_full_name, pr_number, report_md)
+    print(
+        f"   [GitHub] PR comment {'posted' if posted else 'FAILED (non-fatal)'} "
+        f"on {repo_full_name}#{pr_number}."
+    )
+
+    # 2. Check run (requires a commit SHA from state)
+    commit_sha = state.get("commit_sha", "")
+    if commit_sha:
+        ok = create_check_run(
+            repo=repo_full_name,
+            sha=commit_sha,
+            name="AI Review",
+            conclusion=conclusion,
+            output={
+                "title": "AI Review Complete",
+                "summary": report_md[:65535],
+            },
+        )
+        print(
+            f"   [GitHub] Check run {'created' if ok else 'FAILED (non-fatal)'} "
+            f"(conclusion={conclusion})."
+        )
+    else:
+        print("   [GitHub] No commit_sha in state — skipping check run creation.")

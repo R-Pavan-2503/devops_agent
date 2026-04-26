@@ -49,7 +49,12 @@ def _get_github_headers() -> dict:
 
 async def verify_github_signature(request: Request):
     """Verifies the HMAC-SHA256 signature sent by GitHub."""
-    secret_str = os.getenv("GITHUB_WEBHOOK_SECRET", "my_super_secret_key")
+    secret_str = os.getenv("GITHUB_WEBHOOK_SECRET")
+    if not secret_str:
+        raise RuntimeError(
+            "GITHUB_WEBHOOK_SECRET environment variable is required but not set. "
+            "Add it to your .env file or deployment environment."
+        )
     secret = secret_str.encode()
 
     github_signature = request.headers.get("x-hub-signature-256")
