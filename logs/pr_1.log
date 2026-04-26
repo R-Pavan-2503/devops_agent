@@ -1,0 +1,134 @@
+
+🚀 [worker] [PR #1] Task received! Initializing pipeline...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|                                                             | 0/103 [00:00<?, ?it/s]Loading weights: 100%|#################################################| 103/103 [00:00<00:00, 1060.42it/s]
+
+🚀 [worker] [PR #1] Task received! Initializing pipeline...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|                                                             | 0/103 [00:00<?, ?it/s]Loading weights: 100%|#################################################| 103/103 [00:00<00:00, 2814.16it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+[vector_store] ChromaDB ready at: D:\projects\ai_agents\try_1\10-agent-devops\chroma_db
+[vector_store] Collection 'enterprise_codebase' — 2183 vectors loaded.
+📦 [worker] [PR #1] Pipeline graph loaded successfully.
+🔍 [worker] [PR #1] Fetching PR diff from GitHub...
+📄 [worker] Fetched: apps/forms/backend/server.js
+📄 [worker] Fetched: apps/forms/frontend/src/App.jsx
+📄 [worker] Fetched: apps/todo/backend/server.js
+📄 [worker] Fetched: apps/todo/frontend/src/App.jsx
+📥 [worker] [PR #1] Cloning full repository for sandbox context...
+✅ [worker] [PR #1] Workspace ready at C:\Users\DELL\AppData\Local\Temp\devops_sandbox_17rp8cv_
+ PR Router: type=frontend | has_tests=False | is_bugfix=False | cross_check=True
+ Backend Analyst: Checking functional logic and efficiency...
+   -> Vote: rejected
+   -> Critique: server.js:63 ? Inefficient validation, missing phone and role validation in frontend App.jsx:17, potential race condition in todo-backend server.js:73
+ Security Agent: Scanning code for vulnerabilities...
+      (Attempt 1) Parsing failed. Retrying... Error: Error code: 413 - {'error': {'message': 'Request too large for model `llama-3.1-8b-instant` in organization `org_01kpk1j344eck9zh2rd8w09a6a` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9268, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+      (Attempt 2) Parsing failed. Retrying... Error: Error code: 413 - {'error': {'message': 'Request too large for model `llama-3.1-8b-instant` in organization `org_01kpk1j344eck9zh2rd8w09a6a` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9268, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+      Final attempt failed: Error code: 413 - {'error': {'message': 'Request too large for model `llama-3.1-8b-instant` in organization `org_01kpk1j344eck9zh2rd8w09a6a` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9268, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+
+🚀 [worker] [PR #1] Task received! Initializing pipeline...
+📦 [worker] [PR #1] Pipeline graph loaded successfully.
+🔍 [worker] [PR #1] Fetching PR diff from GitHub...
+📄 [worker] Fetched: apps/forms/backend/server.js
+📄 [worker] Fetched: apps/forms/frontend/src/App.jsx
+📄 [worker] Fetched: apps/todo/backend/server.js
+📄 [worker] Fetched: apps/todo/frontend/src/App.jsx
+📥 [worker] [PR #1] Cloning full repository for sandbox context...
+✅ [worker] [PR #1] Workspace ready at C:\Users\DELL\AppData\Local\Temp\devops_sandbox_hvf7uo62
+ PR Router: type=frontend | has_tests=False | is_bugfix=False | cross_check=True
+ Backend Analyst: Checking functional logic and efficiency...
+   -> Vote: rejected
+   -> Critique: server.js:63 ? Inconsistent error handling, some errors are returned as json, others are thrown, consider standardizing error responses
+ Security Agent: Scanning code for vulnerabilities...
+      (Attempt 1) Parsing failed. Retrying... Error: Error code: 413 - {'error': {'message': 'Request too large for model `llama-3.1-8b-instant` in organization `org_01kpk1j344eck9zh2rd8w09a6a` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9268, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+      (Attempt 2) Parsing failed. Retrying... Error: Error code: 413 - {'error': {'message': 'Request too large for model `llama-3.1-8b-instant` in organization `org_01kpk1j344eck9zh2rd8w09a6a` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9268, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+      Final attempt failed: Error code: 413 - {'error': {'message': 'Request too large for model `llama-3.1-8b-instant` in organization `org_01kpk1j344eck9zh2rd8w09a6a` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9268, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+
+🚀 [worker] [PR #1] Task received! Initializing pipeline...
+📦 [worker] [PR #1] Pipeline graph loaded successfully.
+🔍 [worker] [PR #1] Fetching PR diff from GitHub...
+📄 [worker] Fetched: apps/forms/backend/server.js
+📄 [worker] Fetched: apps/forms/frontend/src/App.jsx
+📄 [worker] Fetched: apps/todo/backend/server.js
+📄 [worker] Fetched: apps/todo/frontend/src/App.jsx
+📥 [worker] [PR #1] Cloning full repository for sandbox context...
+✅ [worker] [PR #1] Workspace ready at C:\Users\DELL\AppData\Local\Temp\devops_sandbox_px0ay1ic
+ PR Router: type=frontend | has_tests=False | is_bugfix=False | cross_check=True
+ Backend Analyst: Checking functional logic and efficiency...
+   -> Vote: rejected
+   -> Critique: server.js:81 ? Inefficient pattern: unhandled promise rejections in async functions may cause server crashes
+ Security Agent: Scanning code for vulnerabilities...
+      (Attempt 1) Parsing failed. Retrying... Error: Error code: 413 - {'error': {'message': 'Request too large for model `llama-3.1-8b-instant` in organization `org_01kpk1j344eck9zh2rd8w09a6a` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9268, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+      (Attempt 2) Parsing failed. Retrying... Error: Error code: 413 - {'error': {'message': 'Request too large for model `llama-3.1-8b-instant` in organization `org_01kpk1j344eck9zh2rd8w09a6a` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9268, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+      Final attempt failed: Error code: 413 - {'error': {'message': 'Request too large for model `llama-3.1-8b-instant` in organization `org_01kpk1j344eck9zh2rd8w09a6a` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9268, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+
+🚀 [worker] [PR #1] Task received! Initializing pipeline...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|                                                             | 0/103 [00:00<?, ?it/s]Loading weights: 100%|#################################################| 103/103 [00:00<00:00, 3778.32it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+[vector_store] ChromaDB ready at: D:\projects\ai_agents\try_1\10-agent-devops\chroma_db
+[vector_store] Collection 'enterprise_codebase' — 2183 vectors loaded.
+📦 [worker] [PR #1] Pipeline graph loaded successfully.
+🔍 [worker] [PR #1] Fetching PR diff from GitHub...
+📄 [worker] Fetched: apps/forms/backend/server.js
+📄 [worker] Fetched: apps/forms/frontend/src/App.jsx
+📄 [worker] Fetched: apps/todo/backend/server.js
+📄 [worker] Fetched: apps/todo/frontend/src/App.jsx
+📥 [worker] [PR #1] Cloning full repository for sandbox context...
+✅ [worker] [PR #1] Workspace ready at C:\Users\DELL\AppData\Local\Temp\devops_sandbox_pdtibzj_
+ PR Router: type=frontend | has_tests=False | is_bugfix=False | cross_check=True
+ Backend Analyst: Checking functional logic and efficiency...
+   -> Vote: rejected
+   -> Critique: server.js:63 ? Inefficient pattern: unvalidated user input used in res.status(422).json({ success: false, errors }) without sanitization
+ Security Agent: Scanning code for vulnerabilities...
+      (Attempt 1) Parsing failed. Retrying... Error: Error code: 413 - {'error': {'message': 'Request too large for model `llama-3.1-8b-instant` in organization `org_01kpk31pegfejtxb5r2t407vx6` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9270, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+      (Attempt 2) Parsing failed. Retrying... Error: Error code: 413 - {'error': {'message': 'Request too large for model `llama-3.1-8b-instant` in organization `org_01kpk31pegfejtxb5r2t407vx6` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9270, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+      Final attempt failed: Error code: 413 - {'error': {'message': 'Request too large for model `llama-3.1-8b-instant` in organization `org_01kpk31pegfejtxb5r2t407vx6` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9270, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+
+🚀 [worker] [PR #1] Task received! Initializing pipeline...
+📦 [worker] [PR #1] Pipeline graph loaded successfully.
+🔍 [worker] [PR #1] Fetching PR diff from GitHub...
+📄 [worker] Fetched: apps/forms/backend/server.js
+📄 [worker] Fetched: apps/forms/frontend/src/App.jsx
+📄 [worker] Fetched: apps/todo/backend/server.js
+📄 [worker] Fetched: apps/todo/frontend/src/App.jsx
+📥 [worker] [PR #1] Cloning full repository for sandbox context...
+✅ [worker] [PR #1] Workspace ready at C:\Users\DELL\AppData\Local\Temp\devops_sandbox_09p_0qvq
+ PR Router: type=frontend | has_tests=False | is_bugfix=False | cross_check=True
+ Backend Analyst: Checking functional logic and efficiency...
+   -> Vote: rejected
+   -> Critique: server.js:81 ? Inefficient pattern: clearing all completed todos with separate DELETE requests instead of a single request
+ Security Agent: Scanning code for vulnerabilities...
+      (Attempt 1) Parsing failed. Retrying... Error: Error code: 413 - {'error': {'message': 'Request too large for model `llama-3.1-8b-instant` in organization `org_01kpk31pegfejtxb5r2t407vx6` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9270, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+      (Attempt 2) Parsing failed. Retrying... Error: Error code: 413 - {'error': {'message': 'Request too large for model `llama-3.1-8b-instant` in organization `org_01kpk31pegfejtxb5r2t407vx6` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9270, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+      Final attempt failed: Error code: 413 - {'error': {'message': 'Request too large for model `llama-3.1-8b-instant` in organization `org_01kpk31pegfejtxb5r2t407vx6` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9270, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+
+🚀 [worker] [PR #1] Task received! Initializing pipeline...
+📦 [worker] [PR #1] Pipeline graph loaded successfully.
+🔍 [worker] [PR #1] Fetching PR diff from GitHub...
+📄 [worker] Fetched: apps/forms/backend/server.js
+📄 [worker] Fetched: apps/forms/frontend/src/App.jsx
+📄 [worker] Fetched: apps/todo/backend/server.js
+📄 [worker] Fetched: apps/todo/frontend/src/App.jsx
+📥 [worker] [PR #1] Cloning full repository for sandbox context...
+✅ [worker] [PR #1] Workspace ready at C:\Users\DELL\AppData\Local\Temp\devops_sandbox_rnj1jd5q
+ PR Router: type=frontend | has_tests=False | is_bugfix=False | cross_check=True
+ Backend Analyst: Checking functional logic and efficiency...
+   -> Vote: rejected
+   -> Critique: server.js:81 ? Inefficient pattern: clearing all completed todos with separate filter and delete operations, potential race condition if multiple clients access simultaneously
+ Security Agent: Scanning code for vulnerabilities...
+      (Attempt 1) Parsing failed. Retrying... Error: Error code: 413 - {'error': {'message': 'Request too large for model `llama-3.1-8b-instant` in organization `org_01kpk31pegfejtxb5r2t407vx6` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9270, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+      (Attempt 2) Parsing failed. Retrying... Error: Error code: 413 - {'error': {'message': 'Request too large for model `llama-3.1-8b-instant` in organization `org_01kpk31pegfejtxb5r2t407vx6` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9270, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+      Final attempt failed: Error code: 413 - {'error': {'message': 'Request too large for model `llama-3.1-8b-instant` in organization `org_01kpk31pegfejtxb5r2t407vx6` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9270, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}

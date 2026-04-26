@@ -18,11 +18,46 @@ import subprocess
 import tempfile
 
 import httpx
+import contextlib
 import sys
 from celery import Celery
 
 # Ensure project root is in path for imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+class TeeStream:
+    def __init__(self, stream1, stream2):
+        self.stream1 = stream1
+        self.stream2 = stream2
+        self.flush_count = 0
+    def write(self, data):
+        self.stream1.write(data)
+        self.stream2.write(data)
+        if self.flush_count % 10 == 0 or "\n" in data:
+            self.stream2.flush()
+            self.stream1.flush()
+        self.flush_count += 1
+    def flush(self):
+        self.stream1.flush()
+        self.stream2.flush()
+
+    def isatty(self):
+        # Fallback to the original stream's isatty status
+        return getattr(self.stream1, 'isatty', lambda: False)()
+
+@contextlib.contextmanager
+def tee_stdout_stderr(filepath):
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, 'a', encoding='utf-8') as f:
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        sys.stdout = TeeStream(original_stdout, f)
+        sys.stderr = TeeStream(original_stderr, f)
+        try:
+            yield
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
 
 logger = logging.getLogger(__name__)
 
@@ -113,89 +148,92 @@ def _clone_repo_for_pr(repo_full_name: str, head_sha: str, github_token: str) ->
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=10)
 def process_pull_request_task(self, payload_dict: dict):
     pr_number     = payload_dict.get("number", 0)
-    repo_info     = payload_dict.get("repository", {})
-    repo_full_name = repo_info.get("full_name", "")
     
-    print(f"\n🚀 [worker] [PR #{pr_number}] Task received! Initializing pipeline...")
-    
-    # --- Late import ---
-    from graph.builder import app as pipeline_app
-    print(f"📦 [worker] [PR #{pr_number}] Pipeline graph loaded successfully.")
+    log_file = os.path.join(os.path.dirname(__file__), "..", "logs", f"pr_{pr_number}.log")
+    with tee_stdout_stderr(log_file):
+        repo_info     = payload_dict.get("repository", {})
+        repo_full_name = repo_info.get("full_name", "")
+        
+        print(f"\n🚀 [worker] [PR #{pr_number}] Task received! Initializing pipeline...")
+        
+        # --- Late import ---
+        from graph.builder import app as pipeline_app
+        print(f"📦 [worker] [PR #{pr_number}] Pipeline graph loaded successfully.")
 
-    repo_name     = repo_info.get("name", "")
-    pr_info       = payload_dict.get("pull_request", {})
-    pr_title      = pr_info.get("title", "")
-    pr_body       = pr_info.get("body", "") or ""
-    pr_url        = pr_info.get("html_url", "")
-    head_info     = pr_info.get("head", {})
-    head_sha      = head_info.get("sha", "")
-    uac_context   = "" 
+        repo_name     = repo_info.get("name", "")
+        pr_info       = payload_dict.get("pull_request", {})
+        pr_title      = pr_info.get("title", "")
+        pr_body       = pr_info.get("body", "") or ""
+        pr_url        = pr_info.get("html_url", "")
+        head_info     = pr_info.get("head", {})
+        head_sha      = head_info.get("sha", "")
+        uac_context   = "" 
 
-    print(f"🔍 [worker] [PR #{pr_number}] Fetching PR diff from GitHub...")
-    github_token = os.getenv("GITHUB_TOKEN", "")
-    current_files = _fetch_pr_files(repo_full_name, pr_number, github_token)
+        print(f"🔍 [worker] [PR #{pr_number}] Fetching PR diff from GitHub...")
+        github_token = os.getenv("GITHUB_TOKEN", "")
+        current_files = _fetch_pr_files(repo_full_name, pr_number, github_token)
 
-    if not current_files:
-        logger.warning("[worker] No files fetched for PR #%s — pipeline aborted.", pr_number)
-        return {
-            "pr_number": pr_number,
-            "status": "aborted",
-            "reason": "No reviewable files found in PR diff",
-        }
-
-    # Clone the full repo so the Sandbox has all context
-    print(f"📥 [worker] [PR #{pr_number}] Cloning full repository for sandbox context...")
-    cloned_workspace = _clone_repo_for_pr(repo_full_name, head_sha, github_token)
-    print(f"✅ [worker] [PR #{pr_number}] Workspace ready at {cloned_workspace}")
-
-    initial_state = {
-        "pr_url":           pr_url,
-        "pr_title":         pr_title,
-        "pr_body":          pr_body,
-        "current_files":    current_files,
-        "iteration_count":  0,
-        "ast_is_valid":     True,
-        "shadow_passed":    False,
-        "repo_name":        repo_name,
-        "commit_sha":       head_sha,
-        "uac_context":      uac_context,
-        "sandbox_workspace_path": cloned_workspace,
-        "domain_approvals": {
-            "security": "pending",
-            "architecture": "pending",
-            "code_quality": "pending",
-            "qa": "pending",
-            "frontend": "pending",
-            "backend": "pending",
-        },
-        "active_critiques": [],
-        "full_history":     [],
-    }
-
-    try:
-        final_state = None
-        for output in pipeline_app.stream(initial_state):
-            for node_name in output:
-                logger.info("[worker] [OK] %s finished (PR #%s)", node_name, pr_number)
-                final_state = output[node_name]
-
-        result = {
-            "pr_number":   pr_number,
-            "repo_name":   repo_name,
-            "status":      "completed",
-            "iterations":  (final_state or {}).get("iteration_count", 0),
-            "human_review_required": (final_state or {}).get("requires_human_review", False),
-        }
-        logger.info("[worker] Pipeline complete for PR #%s: %s", pr_number, result)
-        return result
-
-    except Exception as exc:
-        logger.exception("[worker] Pipeline failed for PR #%s: %s", pr_number, exc)
-        try:
-            raise self.retry(exc=exc)
-        except self.MaxRetriesExceededError:
+        if not current_files:
+            logger.warning("[worker] No files fetched for PR #%s — pipeline aborted.", pr_number)
             return {
                 "pr_number": pr_number,
-                "status": "error",
-                "error": str(exc),
+                "status": "aborted",
+                "reason": "No reviewable files found in PR diff",
             }
+
+        # Clone the full repo so the Sandbox has all context
+        print(f"📥 [worker] [PR #{pr_number}] Cloning full repository for sandbox context...")
+        cloned_workspace = _clone_repo_for_pr(repo_full_name, head_sha, github_token)
+        print(f"✅ [worker] [PR #{pr_number}] Workspace ready at {cloned_workspace}")
+
+        initial_state = {
+            "pr_url":           pr_url,
+            "pr_title":         pr_title,
+            "pr_body":          pr_body,
+            "current_files":    current_files,
+            "iteration_count":  0,
+            "ast_is_valid":     True,
+            "shadow_passed":    False,
+            "repo_name":        repo_name,
+            "commit_sha":       head_sha,
+            "uac_context":      uac_context,
+            "sandbox_workspace_path": cloned_workspace,
+            "domain_approvals": {
+                "security": "pending",
+                "architecture": "pending",
+                "code_quality": "pending",
+                "qa": "pending",
+                "frontend": "pending",
+                "backend": "pending",
+            },
+            "active_critiques": [],
+            "full_history":     [],
+        }
+
+        try:
+            final_state = None
+            for output in pipeline_app.stream(initial_state):
+                for node_name in output:
+                    logger.info("[worker] [OK] %s finished (PR #%s)", node_name, pr_number)
+                    final_state = output[node_name]
+
+            result = {
+                "pr_number":   pr_number,
+                "repo_name":   repo_name,
+                "status":      "completed",
+                "iterations":  (final_state or {}).get("iteration_count", 0),
+                "human_review_required": (final_state or {}).get("requires_human_review", False),
+            }
+            logger.info("[worker] Pipeline complete for PR #%s: %s", pr_number, result)
+            return result
+
+        except Exception as exc:
+            logger.exception("[worker] Pipeline failed for PR #%s: %s", pr_number, exc)
+            try:
+                raise self.retry(exc=exc)
+            except self.MaxRetriesExceededError:
+                return {
+                    "pr_number": pr_number,
+                    "status": "error",
+                    "error": str(exc),
+                }

@@ -1,0 +1,9 @@
+🚀 [worker] [PR #123] Task received! Initializing pipeline...
+📦 [worker] [PR #123] Pipeline graph loaded successfully.
+🔍 [worker] [PR #123] Fetching PR diff from GitHub...
+📄 [worker] Fetched: src/App.jsx
+📥 [worker] [PR #123] Cloning full repository for sandbox context...
+✅ [worker] [PR #123] Workspace ready at /tmp/devops_sandbox_abc123
+[frontend_agent] Analyzed App.jsx. No major issues found, but missing prop types.
+[security_agent] No security vulnerabilities detected.
+[worker] [OK] Review phase finished (PR #123)
