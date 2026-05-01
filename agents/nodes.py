@@ -17,6 +17,7 @@ from agents.sandbox import (
     run_tests_in_docker,
     teardown_workspace,
 )
+from context_engine.toon_parser import generate_toon_skeleton
 
 load_dotenv()
 
@@ -220,6 +221,27 @@ def format_files_raw(files_dict) -> str:
         formatted += f"\n--- FILE: {filepath} ---\n{content}\n"
     return formatted.strip()
 
+def format_files_for_reviewers(current_files: dict, diff_files: dict) -> str:
+    """
+    Builds the ultra-lightweight payload for 8b fast reviewers.
+    Combines the TOON Skeleton and the exact Git Patch to eliminate tokens.
+    """
+    if not isinstance(current_files, dict):
+        return str(current_files)
+
+    formatted = ""
+    for filepath, content in current_files.items():
+        toon_skeleton = generate_toon_skeleton(content, filepath)
+        patch = diff_files.get(filepath, "No patch available")
+        
+        formatted += f"\n[FILE: {filepath}]\n"
+        formatted += "--- STRUCTURE (TOON) ---\n"
+        formatted += toon_skeleton + "\n"
+        formatted += "--- EXACT CHANGES (PATCH) ---\n"
+        formatted += patch + "\n"
+    
+    return formatted.strip()
+
 
 def read_file_numbered(filepath: str) -> str:
     """
@@ -253,7 +275,7 @@ def security_agent_node(state: AgentState):
     time.sleep(2)
     print(" Security Agent: Scanning code for vulnerabilities...")
 
-    code = format_files_numbered(state.get("current_files", {}))
+    code = format_files_for_reviewers(state.get("current_files", {}), state.get("diff_files", {}))
     messages = [
         SystemMessage(content=SECURITY_AGENT_PROMPT),
         HumanMessage(content=f"Review this pull request code for security vulnerabilities:\n\n{code}")
@@ -289,7 +311,7 @@ def architecture_agent_node(state: AgentState):
     time.sleep(2)
     print(" Architecture Agent: Checking structural design (with codebase context)...")
 
-    code = format_files_numbered(state.get("current_files", {}))
+    code = format_files_for_reviewers(state.get("current_files", {}), state.get("diff_files", {}))
     repo_name = state.get("repo_name", "")
     cached_context = state.get("arch_codebase_context", "")
 
@@ -389,7 +411,7 @@ def backend_analyst_node(state: AgentState):
         
     print(" Backend Analyst: Checking functional logic and efficiency...")
 
-    code = format_files_numbered(state.get("current_files", {}))
+    code = format_files_for_reviewers(state.get("current_files", {}), state.get("diff_files", {}))
     uac_context = state.get("uac_context", "").strip()
 
     uac_block = (
@@ -426,7 +448,7 @@ def code_quality_agent_node(state: AgentState):
     time.sleep(2)
     print(" Code Quality Agent: Checking for clean code...")
 
-    code = format_files_numbered(state.get("current_files", {}))
+    code = format_files_for_reviewers(state.get("current_files", {}), state.get("diff_files", {}))
     messages = [
         SystemMessage(content=CODE_QUALITY_AGENT_PROMPT),
         HumanMessage(content=code)
@@ -465,7 +487,7 @@ def qa_agent_node(state):
     time.sleep(2)
     print(" QA Agent: Checking testability and mocks...")
 
-    code = format_files_numbered(state.get("current_files", {}))
+    code = format_files_for_reviewers(state.get("current_files", {}), state.get("diff_files", {}))
     uac_context = state.get("uac_context", "").strip()
  
     uac_block = (
@@ -515,7 +537,7 @@ def frontend_agent_node(state: AgentState):
 
     print(" Frontend Agent: Checking API contract and formatting...")
 
-    code = format_files_numbered(state.get("current_files", {}))
+    code = format_files_for_reviewers(state.get("current_files", {}), state.get("diff_files", {}))
     messages = [
         SystemMessage(content=FRONTEND_AGENT_PROMPT),
         HumanMessage(content=code)

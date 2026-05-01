@@ -1,0 +1,13 @@
+
+🚀 [worker] [PR #3] Task received! Initializing pipeline...
+📦 [worker] [PR #3] Pipeline graph loaded successfully.
+🔍 [worker] [PR #3] Fetching PR diff from GitHub...
+📄 [worker] Fetched: apps/todo/backend/server.js
+📄 [worker] Fetched: apps/todo/frontend/src/App.jsx
+📥 [worker] [PR #3] Cloning full repository for sandbox context...
+✅ [worker] [PR #3] Workspace ready at C:\Users\DELL\AppData\Local\Temp\devops_sandbox_ue_7yeuz
+ PR Router: type=frontend | has_tests=False | is_bugfix=False | cross_check=True
+ Backend Analyst: Checking functional logic and efficiency...
+      (Attempt 1) Parsing failed. Retrying... Error: Error code: 429 - {'error': {'message': 'Rate limit reached for model `llama-3.3-70b-versatile` in organization `org_01kpk31pegfejtxb5r2t407vx6` service tier `on_demand` on tokens per day (TPD): Limit 100000, Used 99621, Requested 1809. Please try again in 20m35.52s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+      (Attempt 2) Parsing failed. Retrying... Error: Error code: 429 - {'error': {'message': 'Rate limit reached for model `llama-3.3-70b-versatile` in organization `org_01kpk31pegfejtxb5r2t407vx6` service tier `on_demand` on tokens per day (TPD): Limit 100000, Used 99615, Requested 1809. Please try again in 20m30.336s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}
+      Final attempt failed: Error code: 429 - {'error': {'message': 'Rate limit reached for model `llama-3.3-70b-versatile` in organization `org_01kpk31pegfejtxb5r2t407vx6` service tier `on_demand` on tokens per day (TPD): Limit 100000, Used 99609, Requested 1809. Please try again in 20m25.152s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}

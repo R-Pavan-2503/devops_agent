@@ -22,6 +22,9 @@ import os
 
 import httpx
 from fastapi import FastAPI, status, Request, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+import asyncio
 from dotenv import load_dotenv
 
 from api.models import WebhookPayload
@@ -30,6 +33,14 @@ from worker.celery_app import process_pull_request_task
 load_dotenv()
 
 app = FastAPI(title="10-Agent DevOps Pipeline")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -197,3 +208,58 @@ async def receive_webhook(
 
     # --- Any other action (assigned, labeled, etc.) — acknowledge but skip ---
     return {"message": f"Event '{action}' acknowledged. No action taken."}
+
+
+# ---------------------------------------------------------------------------
+# Dashboard Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/prs")
+async def list_prs():
+    """List available PR logs from the logs directory."""
+    logs_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
+    if not os.path.exists(logs_dir):
+        return {"prs": []}
+    
+    prs = []
+    for file in os.listdir(logs_dir):
+        if file.startswith("pr_") and file.endswith(".log"):
+            pr_num = file[3:-4]
+            prs.append(pr_num)
+    # Sort descending by PR number if possible
+    return {"prs": sorted(prs, key=lambda x: int(x) if x.isdigit() else 0, reverse=True)}
+
+@app.get("/api/prs/{pr_id}/logs")
+async def get_pr_logs(pr_id: str):
+    """Get the full historical log for a PR."""
+    log_path = os.path.join(os.path.dirname(__file__), "..", "logs", f"pr_{pr_id}.log")
+    if not os.path.exists(log_path):
+        raise HTTPException(status_code=404, detail="Logs not found for this PR.")
+    
+    with open(log_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    return {"logs": content}
+
+async def log_generator(log_path: str):
+    """Yields log lines as SSE. If EOF, wait for new content."""
+    with open(log_path, "r", encoding="utf-8") as f:
+        while True:
+            line = f.readline()
+            if not line:
+                await asyncio.sleep(0.5)
+                continue
+            # Format as Server-Sent Event
+            yield f"data: {line}\n\n"
+
+@app.get("/api/prs/{pr_id}/logs/stream")
+async def stream_pr_logs(pr_id: str):
+    """Stream logs for a PR using Server-Sent Events."""
+    log_path = os.path.join(os.path.dirname(__file__), "..", "logs", f"pr_{pr_id}.log")
+    
+    # If the file doesn't exist yet, we create an empty one so it can be tail-ed
+    if not os.path.exists(log_path):
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(f"Waiting for PR #{pr_id} logs to start...\n")
+
+    return StreamingResponse(log_generator(log_path), media_type="text/event-stream")

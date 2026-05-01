@@ -78,7 +78,7 @@ export default function App() {
       <div className="max-w-md w-full space-y-8 bg-white p-8 rounded-2xl shadow-xl border border-gray-100">
         <div>
           <h2 className="mt-2 text-center text-3xl font-extrabold text-gray-900">
-            Contact Us
+            Contact Us and everyone
           </h2>
           <p className="mt-2 text-center text-sm text-gray-600">
             We'd love to hear from you. Please fill out this form.
@@ -86,9 +86,7 @@ export default function App() {
         </div>
 
         {feedback && (
-          <div className={`p-4 rounded-xl text-sm font-medium ${
-            status === 'success' ? 'bg-green-50 text-green-800 border border-green-200' : 'bg-red-50 text-red-800 border border-red-200'
-          }`}>
+          <div className={`p-4 rounded-xl text-sm font-medium ${status === 'success' ? 'bg-green-50 text-green-800 border border-green-200' : 'bg-red-50 text-red-800 border border-red-200'}`}>
             {feedback}
           </div>
         )}
