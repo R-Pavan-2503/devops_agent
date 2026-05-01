@@ -166,8 +166,14 @@ def process_pull_request_task(self, payload_dict: dict):
         
         print(f"\n🚀 [worker] [PR #{pr_number}] Task received! Initializing pipeline...")
         
+        runtime_settings = payload_dict.get("runtime_settings")
+        from agents.runtime_config import apply_session_settings
+        apply_session_settings(runtime_settings if isinstance(runtime_settings, dict) else {})
+
         # --- Late import ---
         from graph.builder import app as pipeline_app
+        from agents.nodes import reload_runtime_models
+        reload_runtime_models()
         print(f"📦 [worker] [PR #{pr_number}] Pipeline graph loaded successfully.")
 
         repo_name     = repo_info.get("name", "")

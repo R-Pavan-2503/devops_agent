@@ -1,13 +1,18 @@
-"""
+﻿"""
 context_engine/vector_store.py
 
 ChromaDB Vector Store Wrapper using local sentence-transformers embeddings.
-No API key required — completely offline via all-MiniLM-L6-v2.
+No API key required â€” completely offline via all-MiniLM-L6-v2.
+DEPRECATION NOTICE:
+As of 2026-05-01 this module is rollback-only for one week while the
+deterministic RepoMap + KnowledgeMap engine is active in production.
+Planned cleanup: remove Chroma dependencies and this module after rollback window.
+
 
 Exposes three public functions used throughout the system:
-    - add_chunks(chunks)             → bulk upsert
-    - delete_by_file(file, repo)     → remove stale vectors on PR merge
-    - search(query, repo, n)         → semantic similarity search
+    - add_chunks(chunks)             â†’ bulk upsert
+    - delete_by_file(file, repo)     â†’ remove stale vectors on PR merge
+    - search(query, repo, n)         â†’ semantic similarity search
 """
 
 import os
@@ -33,7 +38,7 @@ _embedding_fn = SentenceTransformerEmbeddingFunction(
     device="cpu",           # change to "cuda" if you have a GPU
 )
 
-# Persistent client — data survives restarts in ./chroma_db/
+# Persistent client â€” data survives restarts in ./chroma_db/
 _client = chromadb.PersistentClient(path=_CHROMA_PATH)
 
 # Create or reuse the collection
@@ -44,7 +49,7 @@ _collection = _client.get_or_create_collection(
 )
 
 print(f"[vector_store] ChromaDB ready at: {_CHROMA_PATH}")
-print(f"[vector_store] Collection '{_COLLECTION_NAME}' — {_collection.count()} vectors loaded.")
+print(f"[vector_store] Collection '{_COLLECTION_NAME}' â€” {_collection.count()} vectors loaded.")
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +87,7 @@ def delete_by_file(file_path: str, repo_name: str) -> int:
     Delete all vectors whose metadata matches both file_path AND repo_name.
     Used during the incremental webhook sync to flush stale chunks before re-ingesting.
 
-    Returns the number of deleted vectors (approximate — ChromaDB returns None on delete).
+    Returns the number of deleted vectors (approximate â€” ChromaDB returns None on delete).
     """
     results = _collection.get(
         where={

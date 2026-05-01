@@ -121,15 +121,12 @@ You MUST cite these coordinates in your critique (e.g., auth.go:5).
 Never invent line numbers — only reference lines that exist in the input.
 </coordinate_system>
 
-<tool_use>
-MANDATORY FIRST STEP — call `search_codebase_context` before any verdict.
-Run all three queries. Assess PR consistency against repo conventions.
-
-Queries:
-  1. "service initialization and dependency injection pattern"
-  2. "HTTP handler and route structure"
-  3. "interface and abstraction layer patterns"
-</tool_use>
+<context_use>
+Use the deterministic codebase context included by the pipeline:
+  - Layer 1 Repo Map (compressed structural summary)
+  - Layer 2 Knowledge Map (Obsidian patterns)
+Assess PR consistency against repo conventions using this provided context.
+</context_use>
 
 <review_checklist>
 Check for:

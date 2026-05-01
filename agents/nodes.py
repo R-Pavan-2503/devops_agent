@@ -1,8 +1,9 @@
 import os
 import re
+import subprocess
 import time
 from dotenv import load_dotenv
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 from graph.state import AgentState
 from agents.prompts import (
@@ -10,13 +11,16 @@ from agents.prompts import (
     DOC_AGENT_PROMPT, CODE_QUALITY_AGENT_PROMPT, ARCHITECT_AGENT_PROMPT, QA_AGENT_PROMPT,
     FRONTEND_AGENT_PROMPT, CRITIQUE_RESOLVE_AGENT_PROMPT
 )
-from agents.tools import search_codebase_context
 from agents.sandbox import (
     setup_workspace,
     update_workspace_files,
     run_tests_in_docker,
     teardown_workspace,
 )
+from agents.runtime_config import get_session_settings, record_usage_from_response
+from agents.wiki_builder_agent import generate_knowledge_map
+from context_engine.knowledge_map_loader import load_knowledge_context
+from context_engine.repo_map_builder import build_repo_map
 from context_engine.toon_parser import generate_toon_skeleton
 
 load_dotenv()
@@ -25,12 +29,12 @@ load_dotenv()
 # LLM INSTANCES
 #
 # Architecture:
-#   - arch_llm       : llama-3.3-70b-versatile  → Architecture Agent (tool-calling, ChromaDB)
+#   - arch_llm       : llama-3.3-70b-versatile  â†’ Architecture Agent (tool-calling, ChromaDB)
 #                      and Developer + Doc Agents (heavy reasoning, code generation)
-#   - review_llm_70b : llama-3.3-70b-versatile  → Backend Analyst (complex logic checking)
-#   - review_llm_8b  : llama-3.1-8b-instant     → Security, Code Quality, Frontend Agents
+#   - review_llm_70b : llama-3.3-70b-versatile  â†’ Backend Analyst (complex logic checking)
+#   - review_llm_8b  : llama-3.1-8b-instant     â†’ Security, Code Quality, Frontend Agents
 #                      (lightweight TOON verdict, no tool calls, universal rules)
-#   - review_llm_scout: llama-4-scout            → QA Agent (separate TPD bucket)
+#   - review_llm_scout: llama-4-scout            â†’ QA Agent (separate TPD bucket)
 #
 # Token Budget per day (Groq Free Tier):
 #   llama-3.3-70b-versatile : 100,000 TPD
@@ -39,41 +43,56 @@ load_dotenv()
 # =============================================================================
 
 # Heavy lifter: tool-calling + code generation
-arch_llm = ChatOpenAI(
-    api_key=os.getenv("GROQ_API_KEY"),
-    base_url="https://api.groq.com/openai/v1",
-    model="llama-3.3-70b-versatile",
-    max_tokens=3000,
-    temperature=0.2
-)
+architecture_llm = None
 
 # High-quality reviewer: complex backend logic analysis
-review_llm_70b = ChatOpenAI(
-    api_key=os.getenv("GROQ_API_KEY"),
-    base_url="https://api.groq.com/openai/v1",
-    model="llama-3.3-70b-versatile",
-    max_tokens=300,
-    temperature=0.2
-)
+backend_llm = None
 
 # Fast reviewer: universal rule-based checks (security, quality, frontend)
-# 500K TPD — nearly impossible to exhaust
-review_llm_8b = ChatOpenAI(
-    api_key=os.getenv("GROQ_API_KEY"),
-    base_url="https://api.groq.com/openai/v1",
-    model="llama-3.1-8b-instant",
-    max_tokens=300,
-    temperature=0.2
-)
+# 500K TPD â€” nearly impossible to exhaust
+security_llm = None
 
 # QA Agent: Use 8b instance for tests to stay within budget
-review_llm_scout = ChatOpenAI(
-    api_key=os.getenv("GROQ_API_KEY"),
-    base_url="https://api.groq.com/openai/v1",
-    model="llama-3.1-8b-instant",
-    max_tokens=300,
-    temperature=0.2
-)
+qa_llm = None
+code_quality_llm = None
+frontend_llm = None
+critique_llm = None
+development_llm = None
+documentation_llm = None
+wiki_builder_llm = None
+
+_llm_models: dict[int, str] = {}
+
+
+def _create_llm(agent_key: str) -> ChatOpenAI:
+    settings = get_session_settings().get(agent_key, {})
+    params = settings.get("parameters", {})
+    model = str(settings.get("model", "llama-3.1-8b-instant"))
+    llm_kwargs = dict(params)
+    max_tokens = int(llm_kwargs.pop("max_tokens", 300))
+    temperature = float(llm_kwargs.pop("temperature", 0.2))
+    top_p = float(llm_kwargs.pop("top_p", 1.0))
+    frequency_penalty = float(llm_kwargs.pop("frequency_penalty", 0.0))
+    presence_penalty = float(llm_kwargs.pop("presence_penalty", 0.0))
+
+    llm = ChatOpenAI(
+        api_key=os.getenv("GROQ_API_KEY"),
+        base_url="https://api.groq.com/openai/v1",
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
+        **llm_kwargs,
+    )
+    _llm_models[id(llm)] = model
+    return llm
+
+
+def _record_response_usage(llm_instance: ChatOpenAI, response_obj) -> None:
+    model_name = _llm_models.get(id(llm_instance), "unknown")
+    record_usage_from_response(model_name, response_obj)
 
 # =============================================================================
 # TOON Parser (Token-Oriented Object Notation)
@@ -99,6 +118,7 @@ def invoke_strict(messages, llm_instance, max_retries=3):
             )
             new_messages = current_messages + [HumanMessage(content=instructions)]
             res = llm_instance.invoke(new_messages)
+            _record_response_usage(llm_instance, res)
 
             content = res.content.strip()
             if not content:
@@ -136,7 +156,7 @@ def invoke_strict(messages, llm_instance, max_retries=3):
                 # Append the bad response and a strict warning to the history 
                 # so the 0.0 temperature LLM gets a different prompt next time!
                 current_messages.append(res)
-                current_messages.append(HumanMessage(content="You rejected the code but provided no explanation. You MUST provide a specific, actionable critique formatted as '[CATEGORY] file:line — finding'. Do not just say 'REJECT'. Try again."))
+                current_messages.append(HumanMessage(content="You rejected the code but provided no explanation. You MUST provide a specific, actionable critique formatted as '[CATEGORY] file:line â€” finding'. Do not just say 'REJECT'. Try again."))
                 continue
 
             return SpecialistReview(vote=vote, critique=critique)
@@ -155,7 +175,9 @@ def invoke_with_retry(llm_instance, messages, max_retries=5):
     """Generic retry wrapper for raw LLM calls (tool-calling phase)."""
     for attempt in range(max_retries):
         try:
-            return llm_instance.invoke(messages)
+            response = llm_instance.invoke(messages)
+            _record_response_usage(llm_instance, response)
+            return response
         except Exception as e:
             if attempt == max_retries - 1:
                 print(f"      Final attempt failed: {e}")
@@ -164,12 +186,22 @@ def invoke_with_retry(llm_instance, messages, max_retries=5):
             time.sleep(8)
 
 
-# =============================================================================
-# ChromaDB Tool Binding
-# ONLY the Architecture Agent uses tool-calling.
-# =============================================================================
-_context_tools = [search_codebase_context]
-arch_llm_with_tools = arch_llm.bind_tools(_context_tools)
+def reload_runtime_models() -> None:
+    global architecture_llm, backend_llm, security_llm, qa_llm, code_quality_llm
+    global frontend_llm, critique_llm, development_llm, documentation_llm, wiki_builder_llm
+    architecture_llm = _create_llm("architecture")
+    backend_llm = _create_llm("backend")
+    security_llm = _create_llm("security")
+    qa_llm = _create_llm("qa")
+    code_quality_llm = _create_llm("code_quality")
+    frontend_llm = _create_llm("frontend")
+    critique_llm = _create_llm("critique_resolve")
+    development_llm = _create_llm("development")
+    documentation_llm = _create_llm("documentation")
+    wiki_builder_llm = _create_llm("wiki_builder")
+
+
+reload_runtime_models()
 
 
 # =============================================================================
@@ -183,7 +215,7 @@ def safe_print_critique(critique: str):
 
 def format_files_numbered(files_dict) -> str:
     """
-    Coordinate System — Single Source of Truth.
+    Coordinate System â€” Single Source of Truth.
 
     Prepends 1-indexed line numbers to every line of every file:
         1: package main
@@ -210,7 +242,7 @@ def format_files_numbered(files_dict) -> str:
 
 def format_files_raw(files_dict) -> str:
     """
-    Raw formatting — no line numbers.
+    Raw formatting â€” no line numbers.
     Used when the consumer needs executable/writable code (e.g., disk writes).
     """
     if not isinstance(files_dict, dict):
@@ -246,7 +278,7 @@ def format_files_for_reviewers(current_files: dict, diff_files: dict) -> str:
 def read_file_numbered(filepath: str) -> str:
     """
     Reads a single file from disk and returns it with line numbers prepended.
-    Useful for state verification — confirming on-disk code matches state.
+    Useful for state verification â€” confirming on-disk code matches state.
     """
     try:
         with open(filepath, "r", encoding="utf-8") as f:
@@ -263,7 +295,7 @@ def read_file_numbered(filepath: str) -> str:
 
 def security_agent_node(state: AgentState):
     """
-    Security Agent — Universal Rule Checker.
+    Security Agent â€” Universal Rule Checker.
 
     Why NO ChromaDB:
         SQL injection, hardcoded credentials, and missing auth are universal
@@ -280,7 +312,7 @@ def security_agent_node(state: AgentState):
         SystemMessage(content=SECURITY_AGENT_PROMPT),
         HumanMessage(content=f"Review this pull request code for security vulnerabilities:\n\n{code}")
     ]
-    ai_review = invoke_strict(messages, review_llm_8b)
+    ai_review = invoke_strict(messages, security_llm)
 
     print(f"   -> Vote: {ai_review.vote}")
     safe_print_critique(ai_review.critique)
@@ -293,83 +325,87 @@ def security_agent_node(state: AgentState):
 
 def architecture_agent_node(state: AgentState):
     """
-    Architecture Agent — Codebase Pattern Checker.
+    Architecture Agent - Codebase Pattern Checker.
 
-    Why ChromaDB (and only here):
-        This is the ONLY agent that compares the NEW code against your
-        EXISTING codebase conventions (DI patterns, error handling style,
-        layer separation). It needs to see how your repo is structured to
-        make a meaningful architectural verdict.
-
-    ChromaDB Caching Strategy:
-        Round 1: Fetches context from ChromaDB (up to 3 tool calls) and
-                 stores it in state['arch_codebase_context'].
-        Round 2+: Reuses the cached context directly — the existing codebase
-                  hasn't changed between rounds, so there's no need to
-                  re-query. This saves ~4,000 tokens per subsequent round.
+    Deterministic Context Strategy:
+        Round 1:
+          - Layer 1: Build/load Repomix repo map (cached by repo + commit).
+          - Layer 2: Load Obsidian knowledge map. If missing, bootstrap once
+            via Wiki Builder Agent.
+          - Cache composed context in state["arch_codebase_context"].
+        Round 2+:
+          - Reuse cached deterministic context.
     """
     time.sleep(2)
-    print(" Architecture Agent: Checking structural design (with codebase context)...")
+    print(" Architecture Agent: Checking structural design (deterministic context)...")
 
     code = format_files_for_reviewers(state.get("current_files", {}), state.get("diff_files", {}))
     repo_name = state.get("repo_name", "")
     cached_context = state.get("arch_codebase_context", "")
+    commit_sha = state.get("commit_sha", "")
+    workspace_path = state.get("sandbox_workspace_path", "")
 
     if cached_context:
-        # ---------------------------------------------------------------
-        # Rounds 2 and 3: Reuse cached ChromaDB context from Round 1.
-        # The existing codebase doesn't change between review rounds.
-        # ---------------------------------------------------------------
-        print("   [Cache HIT] Reusing codebase context from Round 1 — skipping ChromaDB query.")
+        print("   [Cache HIT] Reusing deterministic context from Round 1.")
         context_gathered = cached_context
-        context_to_save = ""  # Don't overwrite the cache
+        context_to_save = ""
     else:
-        # ---------------------------------------------------------------
-        # Round 1: Fetch from ChromaDB. The LLM can make up to 3 tool
-        # calls to explore different patterns in the codebase.
-        # ---------------------------------------------------------------
-        print("   [Cache MISS] Querying ChromaDB for codebase patterns...")
-        messages = [
-            SystemMessage(content=ARCHITECT_AGENT_PROMPT),
-            HumanMessage(content=(
-                f"Repository: {repo_name}\n\n"
-                f"Review this pull request code:\n\n{code}"
-            ))
-        ]
+        print("   [Cache MISS] Building deterministic context layers...")
+        if not workspace_path:
+            raise RuntimeError(
+                "[Architecture] Missing sandbox_workspace_path. Cannot build repo map."
+            )
 
-        context_gathered = ""
-        for _ in range(1):  # Up to 1 different pattern searches (reduced from 3 to save tokens)
-            time.sleep(2)
-            response = invoke_with_retry(arch_llm_with_tools, messages)
-            messages.append(response)
+        layer1 = build_repo_map(repo_name=repo_name, workspace_path=workspace_path, commit_sha=commit_sha)
+        repo_map_str = layer1["repo_map_str"]
 
-            if not response.tool_calls:
-                break  # LLM decided it has enough context
+        layer2 = load_knowledge_context(repo_name=repo_name, commit_sha=commit_sha)
+        if layer2["map_exists"]:
+            knowledge_context_str = layer2["knowledge_context_str"]
+            source_commit = layer2.get("source_commit", "")
+            if source_commit and commit_sha:
+                try:
+                    drift_out = subprocess.run(
+                        ["git", "rev-list", "--count", f"{source_commit}..{commit_sha}"],
+                        cwd=workspace_path,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=10,
+                    )
+                    drift_count = int((drift_out.stdout or "0").strip() or 0)
+                    if drift_count > 100:
+                        print(
+                            f"[Knowledge Map] Drift warning: knowledge map is {drift_count} commits behind ({source_commit} -> {commit_sha[:8]})."
+                        )
+                except Exception:
+                    print("[Knowledge Map] Drift check skipped (non-fatal).")
+        else:
+            print("   [Knowledge Map] Missing map. Triggering Wiki Builder bootstrap...")
+            generated = generate_knowledge_map(
+                repo_name=repo_name,
+                workspace_path=workspace_path,
+                repo_map_str=repo_map_str,
+                commit_sha=commit_sha,
+                wiki_builder_llm=wiki_builder_llm,
+            )
+            knowledge_context_str = generated["knowledge_context_str"]
 
-            for tool_call in response.tool_calls:
-                if tool_call["name"] == "search_codebase_context":
-                    tool_result = str(search_codebase_context.invoke(tool_call["args"]))
-                    context_gathered += f"\n--- Context ---\n{tool_result}\n"
-                    messages.append(ToolMessage(
-                        tool_call_id=tool_call["id"],
-                        name=tool_call["name"],
-                        content=tool_result
-                    ))
-
-        context_to_save = context_gathered  # Save to state cache
-
-    # Phase 2: Give the final verdict using the gathered context
-    phase2_prompt = ARCHITECT_AGENT_PROMPT.split("<tool_use>")[0] + ARCHITECT_AGENT_PROMPT.split("</tool_use>")[1]
+        context_gathered = (
+            f"[Layer 1 Repo Map]\n{repo_map_str[:4000]}\n\n"
+            f"[Layer 2 Knowledge Map]\n{knowledge_context_str[:2000]}"
+        )
+        context_to_save = context_gathered
 
     final_messages = [
-        SystemMessage(content=phase2_prompt),
+        SystemMessage(content=ARCHITECT_AGENT_PROMPT),
         HumanMessage(content=(
             f"Repository: {repo_name}\n\n"
             f"Review this pull request code:\n\n{code}\n\n"
             f"Relevant codebase patterns for reference:\n{context_gathered}"
         ))
     ]
-    ai_review = invoke_strict(final_messages, arch_llm)
+    ai_review = invoke_strict(final_messages, architecture_llm)
 
     print(f"   -> Vote: {ai_review.vote}")
     safe_print_critique(ai_review.critique)
@@ -377,21 +413,21 @@ def architecture_agent_node(state: AgentState):
     return {
         "domain_approvals": {"architecture": ai_review.vote},
         "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Architecture: {ai_review.critique}"] if ai_review.vote == "rejected" else [],
-        "arch_codebase_context": context_to_save  # Empty string on Rounds 2+, preserve_if_set keeps old value
+        "arch_codebase_context": context_to_save
     }
 
 
 def backend_analyst_node(state: AgentState):
     """
-    Backend Analyst — Functional Logic Checker.
+    Backend Analyst â€” Functional Logic Checker.
 
     Why NO ChromaDB:
         Checks functional correctness: SQL injection risks, connection
         leak patterns, incorrect HTTP status codes, error handling.
-        These are universal backend patterns — no codebase comparison needed.
+        These are universal backend patterns â€” no codebase comparison needed.
         Uses the 70b model for its superior reasoning on complex logic.
 
-    Fix #2 — UAC Injection:
+    Fix #2 â€” UAC Injection:
         If a uac_context is present in state (from the PR description or Jira
         ticket), it is prepended to the code review prompt. This lets the
         analyst verify that the code actually implements the right feature,
@@ -417,14 +453,14 @@ def backend_analyst_node(state: AgentState):
     uac_block = (
         f"User Acceptance Criteria (UAC):\n{uac_context}\n\n"
         "Verify that the code below implements exactly what the UAC describes.\n"
-        "A feature mismatch is a CRITICAL logic flaw — REJECT immediately.\n\n"
+        "A feature mismatch is a CRITICAL logic flaw â€” REJECT immediately.\n\n"
     ) if uac_context else ""
 
     messages = [
         SystemMessage(content=BACKEND_ANALYST_AGENT_PROMPT),
         HumanMessage(content=f"{uac_block}Review this code for functional logic issues:\n\n{code}")
     ]
-    ai_review = invoke_strict(messages, review_llm_70b)
+    ai_review = invoke_strict(messages, backend_llm)
 
     print(f"   -> Vote: {ai_review.vote}")
     safe_print_critique(ai_review.critique)
@@ -437,7 +473,7 @@ def backend_analyst_node(state: AgentState):
 
 def code_quality_agent_node(state: AgentState):
     """
-    Code Quality Agent — Clean Code Checker.
+    Code Quality Agent â€” Clean Code Checker.
 
     Why NO ChromaDB:
         Checks naming conventions, function length, docstrings, nesting
@@ -453,7 +489,7 @@ def code_quality_agent_node(state: AgentState):
         SystemMessage(content=CODE_QUALITY_AGENT_PROMPT),
         HumanMessage(content=code)
     ]
-    ai_review = invoke_strict(messages, review_llm_8b)
+    ai_review = invoke_strict(messages, code_quality_llm)
 
     print(f"   -> Vote: {ai_review.vote}")
     safe_print_critique(ai_review.critique)
@@ -466,24 +502,24 @@ def code_quality_agent_node(state: AgentState):
 
 def qa_agent_node(state):
     """
-    QA / SDET Agent — Testability Checker.
+    QA / SDET Agent â€” Testability Checker.
  
     Dynamic invocation:
         If pr_has_tests=False (set by pr_router_node because no test files
         were found in the PR), this node self-skips immediately.
-        This saves ~300–500 Groq tokens per pipeline run.
+        This saves ~300â€“500 Groq tokens per pipeline run.
  
     When pr_has_tests=True, runs the full coverage gate and testability review.
     """
-    # ── Dynamic skip gate ────────────────────────────────────────────────────
+    # â”€â”€ Dynamic skip gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if not state.get("pr_has_tests", True):
-        print(" QA Agent: No test files detected — skipping (pr_has_tests=False).")
+        print(" QA Agent: No test files detected â€” skipping (pr_has_tests=False).")
         return {
             "domain_approvals": {"qa": "approved"},
             "active_critiques": [],  # empty list = no-op with wipeable_add reducer
         }
  
-    # ── Full review path ─────────────────────────────────────────────────────
+    # â”€â”€ Full review path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     time.sleep(2)
     print(" QA Agent: Checking testability and mocks...")
 
@@ -500,7 +536,7 @@ def qa_agent_node(state):
         SystemMessage(content=QA_AGENT_PROMPT),
         HumanMessage(content=f"{uac_block}{code}"),
     ]
-    ai_review = invoke_strict(messages, review_llm_scout)
+    ai_review = invoke_strict(messages, qa_llm)
  
     print(f"   -> Vote: {ai_review.vote}")
     safe_print_critique(ai_review.critique)
@@ -513,7 +549,7 @@ def qa_agent_node(state):
 
 def frontend_agent_node(state: AgentState):
     """
-    Frontend Integration Agent — API Contract Checker.
+    Frontend Integration Agent â€” API Contract Checker.
 
     Why NO ChromaDB:
         Validates that the API response matches the frontend's expected
@@ -542,7 +578,7 @@ def frontend_agent_node(state: AgentState):
         SystemMessage(content=FRONTEND_AGENT_PROMPT),
         HumanMessage(content=code)
     ]
-    ai_review = invoke_strict(messages, review_llm_8b)
+    ai_review = invoke_strict(messages, frontend_llm)
 
     print(f"   -> Vote: {ai_review.vote}")
     safe_print_critique(ai_review.critique)
@@ -555,7 +591,7 @@ def frontend_agent_node(state: AgentState):
 
 def critique_resolve_agent_node(state: AgentState):
     """
-    Critique Resolve Agent — Conflict Resolution Brain.
+    Critique Resolve Agent â€” Conflict Resolution Brain.
 
     Sits between specialist consensus and the Dev Agent. Produces a single
     Master Directive by:
@@ -577,9 +613,9 @@ def critique_resolve_agent_node(state: AgentState):
 
     if not active_critiques:
         print("   -> No critiques to resolve. All agents approved.")
-        return {"master_directive": "NO_CRITIQUES — all agents approved."}
+        return {"master_directive": "NO_CRITIQUES â€” all agents approved."}
 
-    # ── Phase 1: Programmatic Pre-Processing ──────────────────────────────
+    # â”€â”€ Phase 1: Programmatic Pre-Processing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     AGENT_PRIORITY = {
         "security": 1,
         "qa": 2,
@@ -603,8 +639,8 @@ def critique_resolve_agent_node(state: AgentState):
     # Extract Round 1 critiques for loop prevention context
     round_1_critiques = [c for c in full_history if "[Round 0]" in c]
 
-    # ── Phase 2: LLM Synthesis ────────────────────────────────────────────
-    round_1_text = "\n".join(round_1_critiques) if round_1_critiques else "(This is Round 1 — no prior history)"
+    # â”€â”€ Phase 2: LLM Synthesis â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    round_1_text = "\n".join(round_1_critiques) if round_1_critiques else "(This is Round 1 â€” no prior history)"
     current_text = "\n".join(sorted_critiques)
 
     human_content = (
@@ -620,7 +656,7 @@ def critique_resolve_agent_node(state: AgentState):
     ]
 
     time.sleep(3)  # Rate limit buffer after all specialists
-    response = invoke_with_retry(arch_llm, messages)
+    response = invoke_with_retry(critique_llm, messages)
 
     master_directive = response.content.strip()
 
@@ -692,7 +728,7 @@ def development_agent_node(state: AgentState):
     ]
 
     time.sleep(8)
-    response = invoke_with_retry(arch_llm, messages)
+    response = invoke_with_retry(development_llm, messages)
 
     new_code = response.content
     checklist = ""
@@ -850,7 +886,7 @@ def development_agent_node(state: AgentState):
 
 def _condense_history(full_log: list, max_entries: int = 12, max_chars_per_entry: int = 120) -> str:
     """
-    Fix #4 — Doc Agent Token Bloat.
+    Fix #4 â€” Doc Agent Token Bloat.
 
     Produces a tight timeline string from the full critique history:
       - Only keeps the last `max_entries` entries (default 12) to stay well
@@ -864,7 +900,7 @@ def _condense_history(full_log: list, max_entries: int = 12, max_chars_per_entry
     condensed = []
     for entry in full_log[-max_entries:]:
         if len(entry) > max_chars_per_entry:
-            condensed.append(entry[:max_chars_per_entry] + " […truncated]")
+            condensed.append(entry[:max_chars_per_entry] + " [â€¦truncated]")
         else:
             condensed.append(entry)
     return "\n".join(condensed) if condensed else "(no history recorded)"
@@ -872,7 +908,7 @@ def _condense_history(full_log: list, max_entries: int = 12, max_chars_per_entry
 
 def documentation_summarizer_node(state: AgentState):
     """
-    Documentation Agent — Report Generator.
+    Documentation Agent â€” Report Generator.
 
     Reads structured verdicts and critiques from state and passes them
     as pre-built data blocks so the LLM copies them verbatim instead of
@@ -880,19 +916,19 @@ def documentation_summarizer_node(state: AgentState):
 
     Sandbox Teardown:
         This node is the single convergence point for BOTH the happy-path
-        (environment_sandbox_node → here) and the failure-path
-        (human_fallback_node → here). Tearing down the Docker workspace here
+        (environment_sandbox_node â†’ here) and the failure-path
+        (human_fallback_node â†’ here). Tearing down the Docker workspace here
         guarantees it is called exactly once, regardless of which path was
         taken, leaving zero footprint on the host machine.
     """
     time.sleep(2)
 
-    # ── Sandbox Teardown (called exactly once, after the 3-round loop) ────
+    # â”€â”€ Sandbox Teardown (called exactly once, after the 3-round loop) â”€â”€â”€â”€
     workspace_path = state.get("sandbox_workspace_path", "")
     if workspace_path:
         try:
             teardown_workspace(workspace_path)
-            print("   [Sandbox] Workspace torn down ✓ — host filesystem clean.")
+            print("   [Sandbox] Workspace torn down âœ“ â€” host filesystem clean.")
         except Exception as e:
             # Non-fatal: log and continue. The report must still be generated.
             print(f"   [Sandbox] Teardown warning (non-fatal): {e}")
@@ -979,7 +1015,7 @@ def documentation_summarizer_node(state: AgentState):
     report_md = ""
     for attempt in range(3):
         try:
-            response = arch_llm.invoke(messages)
+            response = invoke_with_retry(documentation_llm, messages, max_retries=3)
             report_md = response.content.strip()
             if report_md:
                 break
@@ -990,7 +1026,7 @@ def documentation_summarizer_node(state: AgentState):
             time.sleep(3)
 
     if not report_md:
-        report_md = "⚠️ Could not generate the report. The LLM returned empty responses after multiple attempts."
+        report_md = "âš ï¸ Could not generate the report. The LLM returned empty responses after multiple attempts."
 
     try:
         with open("report.md", "w", encoding="utf-8") as f:
@@ -999,7 +1035,7 @@ def documentation_summarizer_node(state: AgentState):
     except Exception as e:
         print(f"   -> Error saving file: {e}")
 
-    # ── Post results back to GitHub (Fix #12) ─────────────────────────────
+    # â”€â”€ Post results back to GitHub (Fix #12) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _post_github_results(state, report_md, final_votes)
 
     return {"human_readable_summary": report_md}
@@ -1009,7 +1045,7 @@ def _post_github_results(state: AgentState, report_md: str, final_votes: dict) -
     """
     Post the review summary as a PR comment and set a GitHub Check Run status.
 
-    Both calls are best-effort — any failure is logged but does not affect
+    Both calls are best-effort â€” any failure is logged but does not affect
     pipeline state or the returned report.
 
     Silently skips when:
@@ -1018,12 +1054,12 @@ def _post_github_results(state: AgentState, report_md: str, final_votes: dict) -
     """
     pr_url = state.get("pr_url", "")
     if not pr_url or "github.com" not in pr_url:
-        print("   [GitHub] Skipping posting — no GitHub PR URL in state (local test mode).")
+        print("   [GitHub] Skipping posting â€” no GitHub PR URL in state (local test mode).")
         return
 
     github_token = os.getenv("GITHUB_TOKEN", "")
     if not github_token:
-        print("   [GitHub] Skipping posting — GITHUB_TOKEN not set.")
+        print("   [GitHub] Skipping posting â€” GITHUB_TOKEN not set.")
         return
 
     # Parse https://github.com/{owner}/{repo}/pull/{number}
@@ -1046,7 +1082,7 @@ def _post_github_results(state: AgentState, report_md: str, final_votes: dict) -
     )
     conclusion = "success" if all_approved else "failure"
 
-    # Late import — avoids loading httpx at module-import time in tests
+    # Late import â€” avoids loading httpx at module-import time in tests
     from api.github_client import post_pr_comment, create_check_run  # noqa: PLC0415
 
     # 1. PR comment
@@ -1074,4 +1110,5 @@ def _post_github_results(state: AgentState, report_md: str, final_votes: dict) -
             f"(conclusion={conclusion})."
         )
     else:
-        print("   [GitHub] No commit_sha in state — skipping check run creation.")
+        print("   [GitHub] No commit_sha in state â€” skipping check run creation.")
+

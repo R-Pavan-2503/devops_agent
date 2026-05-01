@@ -229,7 +229,7 @@ def _get_host_gomodcache() -> Optional[Path]:
 # ---------------------------------------------------------------------------
 
 _CONTAINER_WORKDIR = "/workspace"
-_TIMEOUT_SECONDS   = 60
+_TIMEOUT_SECONDS   = 300
 _GOMODCACHE_CONTAINER = "/root/go/pkg/mod"
 
 

@@ -28,6 +28,15 @@ import asyncio
 from dotenv import load_dotenv
 
 from api.models import WebhookPayload
+from agents.runtime_config import (
+    apply_session_settings,
+    build_model_catalog,
+    get_defaults,
+    get_live_rate_limits,
+    get_session_settings,
+    get_usage_summary,
+    reset_session,
+)
 from worker.celery_app import process_pull_request_task
 
 load_dotenv()
@@ -203,7 +212,9 @@ async def receive_webhook(
 
     # --- Dispatch AI review for new/updated/merged PRs ---
     if action in ("opened", "synchronize", "reopened") or (action == "closed" and pr.merged):
-        process_pull_request_task.delay(payload.model_dump())
+        payload_dict = payload.model_dump()
+        payload_dict["runtime_settings"] = get_session_settings()
+        process_pull_request_task.delay(payload_dict)
         return {"message": f"Webhook received. PR #{payload.number} queued for AI review."}
 
     # --- Any other action (assigned, labeled, etc.) — acknowledge but skip ---
@@ -213,6 +224,46 @@ async def receive_webhook(
 # ---------------------------------------------------------------------------
 # Dashboard Endpoints
 # ---------------------------------------------------------------------------
+
+@app.get("/api/settings")
+async def get_settings():
+    """Return default + current session settings and model availability info."""
+    return {
+        "defaults": get_defaults(),
+        "current": get_session_settings(),
+        **build_model_catalog(),
+    }
+
+
+@app.post("/api/settings/save")
+async def save_settings(payload: dict):
+    """
+    Save session-only settings in memory.
+    Expected shape: { "agents": { ... } }
+    """
+    agents_payload = payload.get("agents", {}) if isinstance(payload, dict) else {}
+    updated = apply_session_settings(agents_payload)
+    return {"message": "Settings saved for this session", "current": updated}
+
+
+@app.post("/api/settings/reset")
+async def reset_settings():
+    """Reset session-only settings + usage counters to defaults."""
+    reset_session()
+    return {"message": "Session settings reset"}
+
+
+@app.get("/api/settings/usage")
+async def get_settings_usage():
+    """Return per-model and total token/credit usage for this server session."""
+    return get_usage_summary()
+
+
+@app.get("/api/settings/rate-limits")
+async def get_rate_limits():
+    """Return current Groq key rate-limit window usage from x-ratelimit-* headers."""
+    return get_live_rate_limits()
+
 
 @app.get("/api/prs")
 async def list_prs():

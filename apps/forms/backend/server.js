@@ -79,8 +79,6 @@ app.post('/submit', (req, res) => {
 
   submissions.unshift(entry);
 
-  console.log(`\n New submission from ${entry.fullName} <${entry.email}>`);
-
   res.status(201).json({
     success: true,
     message: `Thank you, ${entry.fullName}! Your submission has been received.`,
@@ -100,10 +98,8 @@ app.get('/health', (req, res) => res.json({ status: 'ok', port: PORT, app: 'form
 
 // ── Start ──────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n Forms Backend running at http://localhost:${PORT}`);
+  console.log(`\n✅  Forms Backend running at http://localhost:${PORT}`);
   console.log(`   POST /submit`);
   console.log(`   GET  /submissions`);
   console.log(`   DELETE /submissions\n`);
 });
-
-[FILE: apps/todo/backend/server.js]
