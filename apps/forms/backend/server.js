@@ -62,7 +62,7 @@ app.post('/submit', (req, res) => {
   const errors = validate(req.body);
 
   if (Object.keys(errors).length > 0) {
-    return res.status(422).json({ success: false, errors, status: 'validation_error', error_message: 'Validation failed', created_at: new Date().toISOString() });
+    return res.status(422).json({ success: false, errors });
   }
 
   const { fullName, email, subject, message, phone, role } = req.body;
@@ -75,9 +75,6 @@ app.post('/submit', (req, res) => {
     phone: phone?.trim() || null,
     role: role || null,
     submittedAt: new Date().toISOString(),
-    status: 'success',
-    created_at: new Date().toISOString(),
-    error_message: null,
   };
 
   submissions.unshift(entry);
@@ -88,9 +85,6 @@ app.post('/submit', (req, res) => {
     success: true,
     message: `Thank you, ${entry.fullName}! Your submission has been received.`,
     id: entry.id,
-    status: entry.status,
-    created_at: entry.created_at,
-    error_message: entry.error_message,
   });
 });
 
@@ -111,3 +105,5 @@ app.listen(PORT, () => {
   console.log(`   GET  /submissions`);
   console.log(`   DELETE /submissions\n`);
 });
+
+[FILE: apps/todo/backend/server.js]

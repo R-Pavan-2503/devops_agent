@@ -48,7 +48,7 @@ class TeeStream:
 @contextlib.contextmanager
 def tee_stdout_stderr(filepath):
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, 'a', encoding='utf-8') as f:
+    with open(filepath, 'w', encoding='utf-8') as f:
         original_stdout = sys.stdout
         original_stderr = sys.stderr
         sys.stdout = TeeStream(original_stdout, f)
@@ -71,12 +71,12 @@ celery_app = Celery(
 )
 
 
-def _fetch_pr_files(repo_full_name: str, pr_number: int, github_token: str) -> dict[str, str]:
+def _fetch_pr_files(repo_full_name: str, pr_number: int, github_token: str) -> tuple[dict[str, str], dict[str, str]]:
     """
     Fetch only the files changed in this PR from the GitHub API.
 
-    Returns a dict of {filename: content}. Files that are deleted or too
-    large to fetch are silently skipped (non-fatal).
+    Returns a tuple of (current_files, diff_files). Files that are deleted or too
+    large to fetch are silently skipped.
 
     Using PR diff (not a full repo walk) reduces token usage by 80–90% for
     large repos and prevents context-window truncation on large PRs.
@@ -87,6 +87,9 @@ def _fetch_pr_files(repo_full_name: str, pr_number: int, github_token: str) -> d
 
     base_url = f"https://api.github.com/repos/{repo_full_name}/pulls/{pr_number}/files"
     current_files: dict[str, str] = {}
+    diff_files: dict[str, str] = {}
+
+    ALLOWED_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".java", ".cpp", ".c", ".h", ".rs", ".rb", ".php"}
 
     try:
         with httpx.Client(timeout=30.0) as client:
@@ -96,7 +99,7 @@ def _fetch_pr_files(repo_full_name: str, pr_number: int, github_token: str) -> d
                     "[worker] Could not fetch PR files for %s#%s: %s",
                     repo_full_name, pr_number, resp.status_code
                 )
-                return current_files
+                return current_files, diff_files
 
             changed_files = resp.json()  # list of {filename, status, raw_url, ...}
             logger.info("[worker] %d file(s) changed in PR #%s", len(changed_files), pr_number)
@@ -107,6 +110,13 @@ def _fetch_pr_files(repo_full_name: str, pr_number: int, github_token: str) -> d
 
                 if file_status == "removed":
                     continue  # Skip deleted files — no content to review
+
+                ext = os.path.splitext(file_path)[1].lower()
+                if ext not in ALLOWED_EXTS or "package-lock" in file_path or "yarn.lock" in file_path:
+                    logger.info("[worker] Skipping non-code file for AI: %s", file_path)
+                    continue
+
+                diff_files[file_path] = file_info.get("patch", "No patch available")
 
                 raw_url = file_info.get("raw_url", "")
                 if not raw_url:
@@ -127,7 +137,7 @@ def _fetch_pr_files(repo_full_name: str, pr_number: int, github_token: str) -> d
     except Exception as e:
         logger.error("[worker] GitHub API call failed: %s", e)
 
-    return current_files
+    return current_files, diff_files
 
 
 def _clone_repo_for_pr(repo_full_name: str, head_sha: str, github_token: str) -> str:
@@ -171,9 +181,9 @@ def process_pull_request_task(self, payload_dict: dict):
 
         print(f"🔍 [worker] [PR #{pr_number}] Fetching PR diff from GitHub...")
         github_token = os.getenv("GITHUB_TOKEN", "")
-        current_files = _fetch_pr_files(repo_full_name, pr_number, github_token)
+        current_files, diff_files = _fetch_pr_files(repo_full_name, pr_number, github_token)
 
-        if not current_files:
+        if not current_files and not diff_files:
             logger.warning("[worker] No files fetched for PR #%s — pipeline aborted.", pr_number)
             return {
                 "pr_number": pr_number,
@@ -191,6 +201,7 @@ def process_pull_request_task(self, payload_dict: dict):
             "pr_title":         pr_title,
             "pr_body":          pr_body,
             "current_files":    current_files,
+            "diff_files":       diff_files,
             "iteration_count":  0,
             "ast_is_valid":     True,
             "shadow_passed":    False,
