@@ -82,63 +82,54 @@ def post_pr_comment(repo_full_name: str, pr_number: int, body: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Create / update a GitHub Check Run
+# Create / update a GitHub Commit Status
 # ---------------------------------------------------------------------------
 
-CheckConclusion = Literal["success", "failure", "neutral", "cancelled", "timed_out", "action_required"]
+StatusState = Literal["error", "failure", "pending", "success"]
 
-
-def create_check_run(
+def create_commit_status(
     repo: str,
     sha: str,
-    name: str,
-    conclusion: CheckConclusion,
-    output: dict | None = None,
+    state: StatusState,
+    description: str,
+    context: str = "CodeSentinel / AI Review"
 ) -> bool:
     """
-    Create a GitHub Check Run on a specific commit SHA.
+    Create a GitHub Commit Status on a specific commit SHA.
 
-    The check run surfaces directly on the PR's "Checks" tab and can
-    block merges if branch protection rules require it.
+    This replaces Check Runs, as it works with standard Personal Access Tokens.
+    It surfaces as a status check on the PR and can block merges if branch
+    protection rules require it.
 
     Args:
         repo       : Full repo name, e.g. "your-org/backend_pandhi".
         sha        : The head commit SHA of the PR.
-        name       : Display name for the check (e.g. "AI Review").
-        conclusion : One of the GitHub-accepted conclusion values.
-        output     : Optional dict with keys "title" and "summary" (markdown).
-                     summary is capped at 65535 chars by the GitHub API.
+        state      : One of: "error", "failure", "pending", "success".
+        description: Short description of the status (max 140 chars).
+        context    : A string label to differentiate this status from others.
 
     Returns:
         True on success, False on failure (non-fatal; logged).
     """
-    url = f"{_GITHUB_API_BASE}/repos/{repo}/check-runs"
+    url = f"{_GITHUB_API_BASE}/repos/{repo}/statuses/{sha}"
 
-    payload: dict = {
-        "name":        name,
-        "head_sha":    sha,
-        "status":      "completed",
-        "conclusion":  conclusion,
+    payload = {
+        "state": state,
+        "description": description[:140],
+        "context": context
     }
-
-    if output:
-        payload["output"] = {
-            "title":   output.get("title", name),
-            "summary": output.get("summary", "")[:65535],
-        }
 
     try:
         resp = httpx.post(url, json=payload, headers=_auth_headers(), timeout=15.0)
-        if resp.status_code in (200, 201):
-            check_url = resp.json().get("html_url", "")
-            logger.info("[github_client] Check run created: %s (conclusion=%s)", check_url, conclusion)
+        if resp.status_code == 201:
+            logger.info("[github_client] Commit status created for %s: %s", sha[:7], state)
             return True
         else:
             logger.warning(
-                "[github_client] create_check_run failed: %s — %s",
+                "[github_client] create_commit_status failed: %s — %s",
                 resp.status_code, resp.text[:300]
             )
             return False
     except Exception as exc:
-        logger.error("[github_client] create_check_run exception: %s", exc)
+        logger.error("[github_client] create_commit_status exception: %s", exc)
         return False

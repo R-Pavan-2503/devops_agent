@@ -1,4 +1,4 @@
-from typing import Annotated, TypedDict, Optional
+from typing import Annotated, TypedDict
 import operator
 
 # Custom reducer: an empty list [] acts as a 'wipe' signal for short-term memory
@@ -33,10 +33,16 @@ class AgentState(TypedDict):
     current_files: dict[str, str]
     diff_files: dict[str, str]
     repo_name: str          # The repo identifier used in vector store lookups
+    commit_sha: str
     
     # Smart Routing Flags
     pr_type: str 
     needs_api_contract_check: bool
+    lightweight_review: bool
+    skip_pipeline: bool
+    triage_mode: str
+    triage_reason: str
+    force_full_review: bool
 
     # Dynamic invocation flags (set by the router node)
     # True when the PR contains test files — enables QA Agent.
@@ -47,6 +53,9 @@ class AgentState(TypedDict):
     # Anti-Bloat & Validation
     document_ids: list[str] 
     ast_is_valid: bool
+    rule_report: list[dict]
+    rule_max_severity: str
+    rule_auto_reject: bool
 
     # Shadow environment result
     # Annotated with bool_or so a True can never be overwritten back to False.
@@ -54,6 +63,8 @@ class AgentState(TypedDict):
     
     # Specialist Matrix Votes
     domain_approvals: Annotated[dict, merge_votes] 
+    verdict_details: Annotated[dict, merge_votes]
+    quality_scores: Annotated[dict, merge_votes]
     
     # Execution & Negotiation Logs
     active_critiques: Annotated[list[str], wipeable_add]  # Short-term: current round only, wipeable
@@ -70,6 +81,10 @@ class AgentState(TypedDict):
     # Set to True when the iteration limit (3 rounds) is hit without consensus.
     # Signals the dashboard/webhook consumer to escalate to a human reviewer.
     requires_human_review: bool
+    final_verdict: str
+    weighted_score: float
+    vetoed_by: str
+    veto_reason: str
 
     # Codebase context cache: Architecture Agent fetches this ONCE in Round 1.
     # Subsequent rounds reuse it without re-querying ChromaDB.
@@ -83,3 +98,5 @@ class AgentState(TypedDict):
 
     # Holds the stdout/stderr from the Docker compilation check to feed back into the Dev Agent
     sandbox_test_result: str
+    test_quality_label: str
+    test_coverage_signal: float

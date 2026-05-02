@@ -19,6 +19,9 @@ Environment variables (in .env):
 import hmac
 import hashlib
 import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, status, Request, HTTPException, Depends
@@ -28,20 +31,26 @@ import asyncio
 from dotenv import load_dotenv
 
 from api.models import WebhookPayload
+from core.feedback_store import get_latest_verdict_id, save_correction
+from api.github_client import create_commit_status, post_pr_comment
+from config import KNOWLEDGE_MAP_PROJECTS_FOLDER, OBSIDIAN_VAULT_ROOT
 from agents.runtime_config import (
     apply_session_settings,
     build_model_catalog,
     get_defaults,
+    get_agent_verdict_policy,
     get_live_rate_limits,
     get_session_settings,
     get_usage_summary,
     reset_session,
 )
-from worker.celery_app import process_pull_request_task
+from core.llm_router import get_circuit_status
+from worker.celery_app import celery_app as worker_celery_app, process_pull_request_task
 
 load_dotenv()
 
 app = FastAPI(title="10-Agent DevOps Pipeline")
+_FORCE_REVIEW_PRS: set[int] = set()
 
 app.add_middleware(
     CORSMiddleware,
@@ -188,12 +197,95 @@ async def _sync_vector_store_on_merge(payload: WebhookPayload) -> None:
 # Webhook Endpoint
 # ---------------------------------------------------------------------------
 
+def _parse_pr_url(pr_url: str) -> tuple[str, int]:
+    match = re.search(r"https://github\.com/([^/]+/[^/]+)/pull/(\d+)", pr_url or "")
+    if not match:
+        return "", 0
+    return match.group(1), int(match.group(2))
+
+
+def _fetch_pr_head_sha(repo_full_name: str, pr_number: int) -> str:
+    if not repo_full_name or pr_number <= 0:
+        return ""
+    try:
+        url = f"https://api.github.com/repos/{repo_full_name}/pulls/{pr_number}"
+        resp = httpx.get(url, headers=_get_github_headers(), timeout=10.0)
+        if resp.status_code != 200:
+            return ""
+        payload = resp.json()
+        return str((payload.get("head") or {}).get("sha") or "")
+    except Exception:
+        return ""
+
+
+def _handle_cosentinel_comment(payload: dict) -> dict:
+    comment = ((payload.get("comment") or {}).get("body") or "").strip()
+    pr = payload.get("pull_request") or {}
+    pr_url = pr.get("html_url", "")
+    repo = ((payload.get("repository") or {}).get("full_name") or "")
+    owner = ((payload.get("comment") or {}).get("user") or {}).get("login", "")
+    pr_number = int(payload.get("number") or 0)
+
+    if "/cosentinel force-review" in comment:
+        if pr_number > 0:
+            _FORCE_REVIEW_PRS.add(pr_number)
+        return {"message": f"Force-review override recorded for PR #{pr_number}.", "repo": repo, "pr_url": pr_url}
+
+    if comment.lower().startswith("/cosentinel override reason:"):
+        reason = comment.split(":", 1)[1].strip() if ":" in comment else ""
+        verdict_id = get_latest_verdict_id(pr_number=pr_number, repo=repo)
+        if verdict_id is None:
+            return {"message": "No verdict found yet for this PR; correction not saved.", "repo": repo, "pr_url": pr_url}
+        save_correction(verdict_id=verdict_id, corrected_by=owner, correction="false_positive", note=reason)
+        head_sha = _fetch_pr_head_sha(repo, pr_number)
+        if head_sha:
+            create_commit_status(
+                repo=repo,
+                sha=head_sha,
+                state="success",
+                description=f"Override by @{owner}: {reason}"[:140],
+                context="CodeSentinel / AI Review"
+            )
+        post_pr_comment(repo, pr_number, f"CodeSentinel override accepted by @{owner}. Reason: {reason}")
+        return {"message": f"Override correction logged on verdict {verdict_id} and PR status overridden.", "repo": repo, "pr_url": pr_url}
+
+    if comment.lower().startswith("/cosentinel learn:"):
+        pattern_text = comment.split(":", 1)[1].strip() if ":" in comment else ""
+        repo_name = (payload.get("repository") or {}).get("name", "unknown")
+        repo_dir = OBSIDIAN_VAULT_ROOT / KNOWLEDGE_MAP_PROJECTS_FOLDER / repo_name / "patterns"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        filename = f"learned_pattern_{stamp}.md"
+        target = repo_dir / filename
+        target.write_text(f"# Learned Pattern\n\n{pattern_text}\n", encoding="utf-8")
+        return {"message": f"Learned pattern saved to {target}", "repo": repo, "pr_url": pr_url}
+
+    return {"message": "No cosentinel command found in comment."}
+
+
+def _active_pipeline_count() -> int:
+    try:
+        inspector = worker_celery_app.control.inspect()
+        active = inspector.active() or {}
+        queued = inspector.reserved() or {}
+        return sum(len(v or []) for v in active.values()) + sum(len(v or []) for v in queued.values())
+    except Exception:
+        return 0
+
+
 @app.post("/webhook", status_code=status.HTTP_202_ACCEPTED)
 async def receive_webhook(
-    payload: WebhookPayload,
     request: Request,
-    _=Depends(verify_github_signature)
+    _=Depends(verify_github_signature),
 ):
+    payload_dict = await request.json()
+    event_name = request.headers.get("x-github-event", "")
+    action = payload_dict.get("action", "")
+
+    if event_name in {"issue_comment", "pull_request_review_comment"}:
+        return _handle_cosentinel_comment(payload_dict)
+
+    payload = WebhookPayload.model_validate(payload_dict)
     """
     Main webhook handler.
 
@@ -212,9 +304,18 @@ async def receive_webhook(
 
     # --- Dispatch AI review for new/updated/merged PRs ---
     if action in ("opened", "synchronize", "reopened") or (action == "closed" and pr.merged):
-        payload_dict = payload.model_dump()
-        payload_dict["runtime_settings"] = get_session_settings()
-        process_pull_request_task.delay(payload_dict)
+        max_concurrent = int(os.getenv("MAX_CONCURRENT_PIPELINES", "3"))
+        active = _active_pipeline_count()
+        outgoing = payload.model_dump()
+        outgoing["runtime_settings"] = get_session_settings()
+        forced = payload.number in _FORCE_REVIEW_PRS
+        outgoing["force_full_review"] = forced
+        outgoing["merged_event"] = bool(action == "closed" and pr.merged)
+        if forced:
+            _FORCE_REVIEW_PRS.discard(payload.number)
+        process_pull_request_task.delay(outgoing)
+        if active >= max_concurrent:
+            return {"message": f"CodeSentinel: Review queued ({active} active). You are in line."}
         return {"message": f"Webhook received. PR #{payload.number} queued for AI review."}
 
     # --- Any other action (assigned, labeled, etc.) — acknowledge but skip ---
@@ -263,6 +364,15 @@ async def get_settings_usage():
 async def get_rate_limits():
     """Return current Groq key rate-limit window usage from x-ratelimit-* headers."""
     return get_live_rate_limits()
+
+
+@app.get("/api/settings/provider-status")
+async def get_provider_status():
+    """Return provider circuit breaker status and verdict weighting policy."""
+    return {
+        "circuit_status": get_circuit_status(),
+        "verdict_policy": get_agent_verdict_policy(),
+    }
 
 
 @app.get("/api/prs")

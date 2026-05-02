@@ -28,4 +28,4 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["api*", "graph*", "agents*", "worker*", "sandbox*", "context_engine*"]
+include = ["api*", "graph*", "agents*", "worker*", "sandbox*", "context_engine*", "core*"]

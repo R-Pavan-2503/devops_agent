@@ -17,6 +17,8 @@ No LLM call is made — purely deterministic heuristics so zero tokens are spent
 import re
 from pathlib import Path
 from graph.state import AgentState
+from core.feedback_store import record_coverage_signal
+from core.test_quality import evaluate_test_quality
 
 # ---------------------------------------------------------------------------
 # File-type heuristics
@@ -39,6 +41,13 @@ _FEATURE_PATTERNS = re.compile(
     r"\b(feat|feature|add|implement|new|enhance|support)\b",
     re.IGNORECASE,
 )
+
+
+def _extract_pr_number(pr_url: str) -> int:
+    match = re.search(r"/pull/(\d+)", pr_url or "")
+    if not match:
+        return 0
+    return int(match.group(1))
 
 
 def _classify_pr_type(files_dict: dict[str, str]) -> str:
@@ -104,14 +113,29 @@ def pr_router_node(state: AgentState) -> dict:
     # Cross-discipline check is needed whenever the PR touches only ONE discipline
     # (a mixed PR already contains both sides — no cross-check needed)
     needs_api_contract_check = pr_type in ("backend", "frontend")
+    changed_paths = list(files_dict.keys())
+    workspace_path = state.get("sandbox_workspace_path", "")
+    coverage_score, quality_label, coverage_map = evaluate_test_quality(changed_paths, workspace_path)
+    pr_number = _extract_pr_number(pr_url)
+    try:
+        record_coverage_signal(pr_number, state.get("repo_name", "unknown"), coverage_score, quality_label)
+    except Exception as exc:
+        print(f" PR Router: coverage signal persistence failed (non-fatal): {exc}")
 
-    print(f" PR Router: type={pr_type} | has_tests={has_tests} | is_bugfix={is_bugfix} | cross_check={needs_api_contract_check}")
+    covered_count = sum(1 for tests in coverage_map.values() if tests)
+    print(
+        " PR Router: "
+        f"type={pr_type} | has_tests={has_tests} | is_bugfix={is_bugfix} "
+        f"| cross_check={needs_api_contract_check} | test_quality={quality_label} ({coverage_score:.2f}, covered={covered_count}/{max(len(coverage_map),1)})"
+    )
 
     return {
         "pr_type":                  pr_type,
         "pr_has_tests":             has_tests,
         "is_bugfix_or_refactor":    is_bugfix,
         "needs_api_contract_check": needs_api_contract_check,
+        "test_coverage_signal":     coverage_score,
+        "test_quality_label":       quality_label,
         # Initialise shadow_passed to False for this run
         "shadow_passed": False,
     }

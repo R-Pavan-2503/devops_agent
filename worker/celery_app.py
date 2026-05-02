@@ -172,7 +172,9 @@ def process_pull_request_task(self, payload_dict: dict):
 
         # --- Late import ---
         from graph.builder import app as pipeline_app
-        from agents.nodes import reload_runtime_models
+        from agents.nodes import reload_runtime_models, wiki_builder_llm
+        from agents.wiki_builder_agent import generate_knowledge_map, update_patterns_from_merge
+        from context_engine.repo_map_builder import build_repo_map
         reload_runtime_models()
         print(f"📦 [worker] [PR #{pr_number}] Pipeline graph loaded successfully.")
 
@@ -202,6 +204,36 @@ def process_pull_request_task(self, payload_dict: dict):
         cloned_workspace = _clone_repo_for_pr(repo_full_name, head_sha, github_token)
         print(f"✅ [worker] [PR #{pr_number}] Workspace ready at {cloned_workspace}")
 
+        if payload_dict.get("merged_event") and cloned_workspace:
+            try:
+                print(f"🗺️ [worker] [PR #{pr_number}] Running targeted pattern update after merge...")
+                update_patterns_from_merge(
+                    repo_name=repo_name,
+                    workspace_path=cloned_workspace,
+                    commit_sha=head_sha,
+                    changed_files=list(current_files.keys()),
+                    diff_files=diff_files,
+                    wiki_builder_llm=wiki_builder_llm,
+                )
+            except Exception as km_err:
+                logger.warning("[worker] Targeted pattern update failed, falling back to full regeneration: %s", km_err)
+                try:
+                    layer1 = build_repo_map(
+                        repo_name=repo_name,
+                        workspace_path=cloned_workspace,
+                        commit_sha=head_sha,
+                        changed_files=list(current_files.keys()),
+                    )
+                    generate_knowledge_map(
+                        repo_name=repo_name,
+                        workspace_path=cloned_workspace,
+                        repo_map_str=layer1["repo_map_str"],
+                        commit_sha=head_sha,
+                        wiki_builder_llm=wiki_builder_llm,
+                    )
+                except Exception as regen_err:
+                    logger.warning("[worker] Full knowledge-map regeneration also failed (non-fatal): %s", regen_err)
+
         initial_state = {
             "pr_url":           pr_url,
             "pr_title":         pr_title,
@@ -214,6 +246,21 @@ def process_pull_request_task(self, payload_dict: dict):
             "repo_name":        repo_name,
             "commit_sha":       head_sha,
             "uac_context":      uac_context,
+            "force_full_review": bool(payload_dict.get("force_full_review", False)),
+            "triage_mode": "FULL",
+            "triage_reason": "",
+            "skip_pipeline": False,
+            "lightweight_review": False,
+            "rule_report": [],
+            "rule_max_severity": "NONE",
+            "rule_auto_reject": False,
+            "final_verdict": "",
+            "weighted_score": 0.0,
+            "vetoed_by": "",
+            "veto_reason": "",
+            "quality_scores": {},
+            "test_quality_label": "UNKNOWN",
+            "test_coverage_signal": 0.0,
             "sandbox_workspace_path": cloned_workspace,
             "domain_approvals": {
                 "security": "pending",
@@ -223,25 +270,37 @@ def process_pull_request_task(self, payload_dict: dict):
                 "frontend": "pending",
                 "backend": "pending",
             },
+            "verdict_details": {},
             "active_critiques": [],
             "full_history":     [],
         }
-
         try:
-            final_state = None
+            final_state = initial_state.copy()
             for output in pipeline_app.stream(initial_state):
-                for node_name in output:
+                for node_name, node_state in output.items():
                     logger.info("[worker] [OK] %s finished (PR #%s)", node_name, pr_number)
-                    final_state = output[node_name]
+                    if node_state:
+                        final_state.update(node_state)
+
+            iterations = final_state.get("iteration_count", 0)
+            human_req = final_state.get("requires_human_review", False)
 
             result = {
                 "pr_number":   pr_number,
                 "repo_name":   repo_name,
                 "status":      "completed",
-                "iterations":  (final_state or {}).get("iteration_count", 0),
-                "human_review_required": (final_state or {}).get("requires_human_review", False),
+                "iterations":  iterations,
+                "human_review_required": human_req,
             }
             logger.info("[worker] Pipeline complete for PR #%s: %s", pr_number, result)
+
+            print("\n" + "=" * 60)
+            if human_req:
+                print(f"\033[91m❌ [worker] Pipeline FAILED for PR #{pr_number}. Human review is required.\033[0m")
+            else:
+                print(f"\033[92m✅ [worker] Pipeline SUCCESS for PR #{pr_number}. Code is approved and can be merged!\033[0m")
+            print("=" * 60 + "\n")
+
             return result
 
         except Exception as exc:

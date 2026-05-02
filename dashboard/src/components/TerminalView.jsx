@@ -80,16 +80,19 @@ const TerminalView = ({ prId }) => {
   }, [logs]);
 
   const formatLogLine = (line) => {
-    if (line.includes('[worker] [OK]') || line.includes('âœ…')) {
+    if (line.includes('STARTING PIPELINE ITERATION')) {
+      return <span className="text-blue-400 font-bold text-base py-1 block">{line}</span>;
+    }
+    if (line.includes('[worker] [OK]') || line.includes('✅')) {
       return <span className="text-success">{line}</span>;
     }
     if (line.includes('Error') || line.includes('Failed') || line.includes('Exception')) {
       return <span className="text-error font-semibold">{line}</span>;
     }
-    if (line.includes('Warning') || line.includes('âš ï¸')) {
+    if (line.includes('Warning') || line.includes('⚠️')) {
       return <span className="text-yellow-400">{line}</span>;
     }
-    if (line.includes('ðŸš€') || line.includes('ðŸ“¦')) {
+    if (line.includes('🚀') || line.includes('📦')) {
       return <span className="text-primary font-medium">{line}</span>;
     }
     if (line.includes('[frontend_agent]') || line.includes('[backend_agent]') || line.includes('[security_agent]')) {

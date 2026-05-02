@@ -58,11 +58,6 @@ atexit.register(_cleanup_orphans)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-if not logger.handlers:
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("[sandbox] %(levelname)s: %(message)s"))
-    logger.addHandler(_handler)
-
 
 # ---------------------------------------------------------------------------
 # Public Dataclass for Test Results

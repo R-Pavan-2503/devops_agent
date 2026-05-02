@@ -27,6 +27,19 @@ Using the repository structure summary and selected core source files:
 No extra prose.
 """
 
+WIKI_PATTERN_UPDATE_PROMPT = """You are a senior software architect updating an existing Obsidian knowledge map after a merged PR.
+Task:
+1. Update ONLY affected files under patterns/*.md.
+2. Preserve unaffected pattern files exactly.
+3. If a new architectural pattern emerged, create one new patterns/<name>.md file.
+4. Return ONLY changed files in this exact format:
+[FILE: patterns/<name>.md]
+```markdown
+...
+```
+No extra prose.
+"""
+
 
 def _get_commit_id(workspace_path: str, fallback: str) -> str:
     try:
@@ -155,4 +168,91 @@ def generate_knowledge_map(
             context += f"\n\n[Pattern File: {p.name}]\n{p.read_text(encoding='utf-8', errors='replace')}"
 
     print(f"[Wiki Builder] Generated knowledge map for {repo_name}: {len(written_files)} files")
+    return {"written_files": written_files, "knowledge_context_str": context}
+
+
+def update_patterns_from_merge(
+    repo_name: str,
+    workspace_path: str,
+    commit_sha: str,
+    changed_files: list[str],
+    diff_files: dict[str, str],
+    wiki_builder_llm,
+) -> dict:
+    """
+    Targeted knowledge-map updater for merged PRs.
+    Updates only patterns/*.md files that need changes.
+    """
+    repo_dir = OBSIDIAN_VAULT_ROOT / KNOWLEDGE_MAP_PROJECTS_FOLDER / repo_name
+    patterns_dir = repo_dir / "patterns"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    patterns_dir.mkdir(parents=True, exist_ok=True)
+
+    existing_patterns = []
+    for p in sorted(patterns_dir.glob("*.md")):
+        try:
+            existing_patterns.append(f"[FILE: patterns/{p.name}]\n{p.read_text(encoding='utf-8', errors='replace')[:6000]}")
+        except Exception:
+            continue
+
+    if not existing_patterns:
+        # If no prior map exists, bootstrap full generation.
+        from context_engine.repo_map_builder import build_repo_map
+
+        layer1 = build_repo_map(repo_name=repo_name, workspace_path=workspace_path, commit_sha=commit_sha, changed_files=changed_files)
+        return generate_knowledge_map(
+            repo_name=repo_name,
+            workspace_path=workspace_path,
+            repo_map_str=layer1["repo_map_str"],
+            commit_sha=commit_sha,
+            wiki_builder_llm=wiki_builder_llm,
+        )
+
+    merged_diff = []
+    for path in changed_files:
+        patch = diff_files.get(path, "")
+        merged_diff.append(f"[FILE: {path}]\n{patch[:4000]}")
+
+    human_content = (
+        f"Repository: {repo_name}\n"
+        f"Commit: {commit_sha}\n\n"
+        f"Changed files:\n{chr(10).join(changed_files[:200])}\n\n"
+        f"PR diff:\n{chr(10).join(merged_diff[:80])}\n\n"
+        f"Existing patterns:\n{chr(10).join(existing_patterns[:30])}\n"
+    )
+    messages = [
+        SystemMessage(content=WIKI_PATTERN_UPDATE_PROMPT),
+        HumanMessage(content=human_content),
+    ]
+    response = wiki_builder_llm.invoke(messages)
+    raw = (response.content or "").strip()
+    blocks = _extract_file_blocks(raw)
+
+    written_files: list[str] = []
+    for rel_path, content in blocks:
+        rel_path = rel_path.strip().replace("\\", "/")
+        if not rel_path.startswith("patterns/"):
+            continue
+        target = repo_dir / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content.strip(), encoding="utf-8")
+        written_files.append(str(target))
+
+    # Keep source_commit current in index.md to reduce staleness drift.
+    index_path = repo_dir / "index.md"
+    if index_path.exists():
+        text = index_path.read_text(encoding="utf-8", errors="replace")
+        if "source_commit:" in text:
+            text = re.sub(r"source_commit:\s*[A-Za-z0-9._-]+", f"source_commit: {commit_sha[:8]}", text)
+        else:
+            text = f"---\nsource_commit: {commit_sha[:8]}\n---\n\n{text}"
+        index_path.write_text(text, encoding="utf-8")
+
+    context = ""
+    if index_path.exists():
+        context = index_path.read_text(encoding="utf-8", errors="replace")
+        for p in sorted(patterns_dir.glob("*.md"))[:2]:
+            context += f"\n\n[Pattern File: {p.name}]\n{p.read_text(encoding='utf-8', errors='replace')}"
+
+    print(f"[Wiki Builder] Targeted merge update for {repo_name}: {len(written_files)} pattern file(s) updated")
     return {"written_files": written_files, "knowledge_context_str": context}

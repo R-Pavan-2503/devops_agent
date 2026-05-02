@@ -19,6 +19,9 @@ from agents.sandbox import (
 )
 from agents.runtime_config import get_session_settings, record_usage_from_response
 from agents.wiki_builder_agent import generate_knowledge_map
+from core.feedback_store import get_agent_history, get_recent_coverage_scores, save_verdict
+from core.llm_router import note_provider_failure, note_provider_success, select_provider
+from core.rate_limiter import register_usage
 from context_engine.knowledge_map_loader import load_knowledge_context
 from context_engine.repo_map_builder import build_repo_map
 from context_engine.toon_parser import generate_toon_skeleton
@@ -29,12 +32,12 @@ load_dotenv()
 # LLM INSTANCES
 #
 # Architecture:
-#   - arch_llm       : llama-3.3-70b-versatile  â†’ Architecture Agent (tool-calling, ChromaDB)
+#   - arch_llm       : llama-3.3-70b-versatile  Ã¢â€ â€™ Architecture Agent (tool-calling, ChromaDB)
 #                      and Developer + Doc Agents (heavy reasoning, code generation)
-#   - review_llm_70b : llama-3.3-70b-versatile  â†’ Backend Analyst (complex logic checking)
-#   - review_llm_8b  : llama-3.1-8b-instant     â†’ Security, Code Quality, Frontend Agents
+#   - review_llm_70b : llama-3.3-70b-versatile  Ã¢â€ â€™ Backend Analyst (complex logic checking)
+#   - review_llm_8b  : llama-3.1-8b-instant     Ã¢â€ â€™ Security, Code Quality, Frontend Agents
 #                      (lightweight TOON verdict, no tool calls, universal rules)
-#   - review_llm_scout: llama-4-scout            â†’ QA Agent (separate TPD bucket)
+#   - review_llm_scout: llama-4-scout            Ã¢â€ â€™ QA Agent (separate TPD bucket)
 #
 # Token Budget per day (Groq Free Tier):
 #   llama-3.3-70b-versatile : 100,000 TPD
@@ -49,7 +52,7 @@ architecture_llm = None
 backend_llm = None
 
 # Fast reviewer: universal rule-based checks (security, quality, frontend)
-# 500K TPD â€” nearly impossible to exhaust
+# 500K TPD Ã¢â‚¬â€ nearly impossible to exhaust
 security_llm = None
 
 # QA Agent: Use 8b instance for tests to stay within budget
@@ -67,7 +70,8 @@ _llm_models: dict[int, str] = {}
 def _create_llm(agent_key: str) -> ChatOpenAI:
     settings = get_session_settings().get(agent_key, {})
     params = settings.get("parameters", {})
-    model = str(settings.get("model", "llama-3.1-8b-instant"))
+    requested_model = str(settings.get("model", "llama-3.1-8b-instant"))
+    provider_cfg = select_provider(requested_model)
     llm_kwargs = dict(params)
     max_tokens = int(llm_kwargs.pop("max_tokens", 300))
     temperature = float(llm_kwargs.pop("temperature", 0.2))
@@ -76,32 +80,107 @@ def _create_llm(agent_key: str) -> ChatOpenAI:
     presence_penalty = float(llm_kwargs.pop("presence_penalty", 0.0))
 
     llm = ChatOpenAI(
-        api_key=os.getenv("GROQ_API_KEY"),
-        base_url="https://api.groq.com/openai/v1",
-        model=model,
+        api_key=provider_cfg.api_key,
+        base_url=provider_cfg.base_url,
+        model=provider_cfg.model,
         max_tokens=max_tokens,
         temperature=temperature,
         top_p=top_p,
-        frequency_penalty=frequency_penalty,
-        presence_penalty=presence_penalty,
+        
+        
         **llm_kwargs,
     )
-    _llm_models[id(llm)] = model
+    _llm_models[id(llm)] = provider_cfg.model
     return llm
 
 
 def _record_response_usage(llm_instance: ChatOpenAI, response_obj) -> None:
     model_name = _llm_models.get(id(llm_instance), "unknown")
     record_usage_from_response(model_name, response_obj)
+    usage = getattr(response_obj, "usage_metadata", None) or {}
+    tokens = int(usage.get("total_tokens") or 0)
+    if tokens > 0:
+        register_usage(model_name, tokens)
 
 # =============================================================================
 # TOON Parser (Token-Oriented Object Notation)
 # =============================================================================
 
 class SpecialistReview:
-    def __init__(self, vote: str, critique: str):
+    def __init__(self, vote: str, critique: str, severity: str, confidence: float):
         self.vote = vote
         self.critique = critique
+        self.severity = severity
+        self.confidence = confidence
+
+
+def _normalize_severity(raw: str) -> str:
+    sev = (raw or "").strip().upper()
+    if sev in {"CRITICAL", "HIGH", "MEDIUM", "LOW"}:
+        return sev
+    return "LOW" if sev else "MEDIUM"
+
+
+def _default_severity_for_vote(vote: str) -> str:
+    return "LOW" if vote == "approved" else "MEDIUM"
+
+
+def _extract_agent_history_block(agent_key: str, repo_name: str) -> str:
+    rows = get_agent_history(agent_key, repo_name, n=10)
+    if not rows:
+        return ""
+    lines = ["## Your Recent History"]
+    for row in rows:
+        vote = str(row.get("vote", "")).upper()
+        sev = str(row.get("severity", ""))
+        critique = str(row.get("critique_text", "")).strip()[:140]
+        correction = str(row.get("correction", "") or "").strip().lower()
+        correction_note = str(row.get("correction_note", "") or "").strip()[:120]
+        if correction:
+            lines.append(f"- {vote} [{sev}] {critique} -> HUMAN:{correction.upper()} ({correction_note})")
+        else:
+            lines.append(f"- {vote} [{sev}] {critique}")
+    lines.append("Adjust judgment based on this history.")
+    return "\n".join(lines)
+
+
+def _extract_pr_number(pr_url: str) -> int:
+    match = re.search(r"/pull/(\d+)", pr_url or "")
+    if not match:
+        return 0
+    return int(match.group(1))
+
+
+def _persist_verdict(state: AgentState, agent_key: str, review: SpecialistReview) -> None:
+    try:
+        save_verdict(
+            pr_number=_extract_pr_number(state.get("pr_url", "")),
+            repo=state.get("repo_name", "unknown"),
+            agent_name=agent_key,
+            vote=review.vote,
+            critique_text=review.critique,
+            severity=review.severity,
+            confidence=review.confidence,
+        )
+    except Exception as exc:
+        print(f"[FeedbackStore] save_verdict failed (non-fatal): {exc}")
+
+
+def _coverage_trend_note(repo_name: str) -> str:
+    try:
+        scores = get_recent_coverage_scores(repo_name, limit=5)
+    except Exception:
+        return "Coverage trend: unavailable"
+    if len(scores) < 5:
+        return "Coverage trend: insufficient history"
+    descending = all(scores[i] < scores[i + 1] for i in range(len(scores) - 1))
+    # scores are DESC by recency; descending means more recent lower than older.
+    if descending:
+        return (
+            "Coverage trend warning: test signal has declined for 5+ consecutive PRs. "
+            "Treat passing tests as weaker evidence and call out architecture risk."
+        )
+    return "Coverage trend: stable"
 
 
 def invoke_strict(messages, llm_instance, max_retries=3):
@@ -114,10 +193,13 @@ def invoke_strict(messages, llm_instance, max_retries=3):
             instructions = (
                 "CRITICAL: Output your response in TOON format exactly as below (no json, no braces):\n"
                 "vote: [APPROVE or REJECT]\n"
+                "severity: [CRITICAL or HIGH or MEDIUM or LOW]\n"
+                "confidence: [0.0 to 1.0]\n"
                 "critique: [your findings here, 1 string only, or empty if approved]"
             )
             new_messages = current_messages + [HumanMessage(content=instructions)]
             res = llm_instance.invoke(new_messages)
+            note_provider_success("groq")
             _record_response_usage(llm_instance, res)
 
             content = res.content.strip()
@@ -138,11 +220,20 @@ def invoke_strict(messages, llm_instance, max_retries=3):
 
             lines = content.split("\n")
             vote = "rejected"
+            severity = ""
+            confidence = 0.6
             critique = ""
             for line in lines:
                 if line.lower().startswith("vote:"):
                     vote_str = line[5:].strip().lower()
                     vote = "approved" if "approve" in vote_str else "rejected"
+                elif line.lower().startswith("severity:"):
+                    severity = _normalize_severity(line.split(":", 1)[1].strip())
+                elif line.lower().startswith("confidence:"):
+                    try:
+                        confidence = float(line.split(":", 1)[1].strip())
+                    except Exception:
+                        confidence = 0.6
                 elif line.lower().startswith("critique:"):
                     critique = line[9:].strip()
                 elif line.strip() and not critique and not line.lower().startswith("vote:"):
@@ -156,12 +247,16 @@ def invoke_strict(messages, llm_instance, max_retries=3):
                 # Append the bad response and a strict warning to the history 
                 # so the 0.0 temperature LLM gets a different prompt next time!
                 current_messages.append(res)
-                current_messages.append(HumanMessage(content="You rejected the code but provided no explanation. You MUST provide a specific, actionable critique formatted as '[CATEGORY] file:line â€” finding'. Do not just say 'REJECT'. Try again."))
+                current_messages.append(HumanMessage(content="You rejected the code but provided no explanation. You MUST provide a specific, actionable critique formatted as '[CATEGORY] file:line Ã¢â‚¬â€ finding'. Do not just say 'REJECT'. Try again."))
                 continue
 
-            return SpecialistReview(vote=vote, critique=critique)
+            confidence = max(0.0, min(1.0, confidence))
+            if not severity:
+                severity = _default_severity_for_vote(vote)
+            return SpecialistReview(vote=vote, critique=critique, severity=severity, confidence=confidence)
 
         except Exception as e:
+            note_provider_failure("groq")
             if attempt == max_retries - 1:
                 print(f"      Final attempt failed: {e}")
                 raise e
@@ -176,9 +271,11 @@ def invoke_with_retry(llm_instance, messages, max_retries=5):
     for attempt in range(max_retries):
         try:
             response = llm_instance.invoke(messages)
+            note_provider_success("groq")
             _record_response_usage(llm_instance, response)
             return response
         except Exception as e:
+            note_provider_failure("groq")
             if attempt == max_retries - 1:
                 print(f"      Final attempt failed: {e}")
                 raise e
@@ -215,7 +312,7 @@ def safe_print_critique(critique: str):
 
 def format_files_numbered(files_dict) -> str:
     """
-    Coordinate System â€” Single Source of Truth.
+    Coordinate System Ã¢â‚¬â€ Single Source of Truth.
 
     Prepends 1-indexed line numbers to every line of every file:
         1: package main
@@ -242,7 +339,7 @@ def format_files_numbered(files_dict) -> str:
 
 def format_files_raw(files_dict) -> str:
     """
-    Raw formatting â€” no line numbers.
+    Raw formatting Ã¢â‚¬â€ no line numbers.
     Used when the consumer needs executable/writable code (e.g., disk writes).
     """
     if not isinstance(files_dict, dict):
@@ -278,7 +375,7 @@ def format_files_for_reviewers(current_files: dict, diff_files: dict) -> str:
 def read_file_numbered(filepath: str) -> str:
     """
     Reads a single file from disk and returns it with line numbers prepended.
-    Useful for state verification â€” confirming on-disk code matches state.
+    Useful for state verification Ã¢â‚¬â€ confirming on-disk code matches state.
     """
     try:
         with open(filepath, "r", encoding="utf-8") as f:
@@ -295,7 +392,7 @@ def read_file_numbered(filepath: str) -> str:
 
 def security_agent_node(state: AgentState):
     """
-    Security Agent â€” Universal Rule Checker.
+    Security Agent Ã¢â‚¬â€ Universal Rule Checker.
 
     Why NO ChromaDB:
         SQL injection, hardcoded credentials, and missing auth are universal
@@ -308,18 +405,35 @@ def security_agent_node(state: AgentState):
     print(" Security Agent: Scanning code for vulnerabilities...")
 
     code = format_files_for_reviewers(state.get("current_files", {}), state.get("diff_files", {}))
+    history_block = _extract_agent_history_block("security", state.get("repo_name", "unknown"))
+    rule_findings = state.get("rule_report", [])
+    high_rule_lines = []
+    for item in rule_findings:
+        if item.get("severity") in {"CRITICAL", "HIGH"}:
+            high_rule_lines.append(
+                f"- {item.get('severity')} {item.get('file_path')}:{item.get('line')} {item.get('message')}"
+            )
+    confirmed_facts = "\n".join(high_rule_lines[:20])
     messages = [
         SystemMessage(content=SECURITY_AGENT_PROMPT),
-        HumanMessage(content=f"Review this pull request code for security vulnerabilities:\n\n{code}")
+        HumanMessage(
+            content=(
+                f"{history_block}\n\n"
+                f"Confirmed deterministic findings:\n{confirmed_facts}\n\n"
+                f"Review this pull request code for security vulnerabilities:\n\n{code}"
+            )
+        )
     ]
     ai_review = invoke_strict(messages, security_llm)
+    _persist_verdict(state, "security", ai_review)
 
     print(f"   -> Vote: {ai_review.vote}")
     safe_print_critique(ai_review.critique)
 
     return {
         "domain_approvals": {"security": ai_review.vote},
-        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Security: {ai_review.critique}"] if ai_review.vote == "rejected" else []
+        "verdict_details": {"security": {"vote": ai_review.vote, "severity": ai_review.severity, "confidence": ai_review.confidence}},
+        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Security [{ai_review.severity}]: {ai_review.critique}"] if ai_review.vote == "rejected" else []
     }
 
 
@@ -356,7 +470,12 @@ def architecture_agent_node(state: AgentState):
                 "[Architecture] Missing sandbox_workspace_path. Cannot build repo map."
             )
 
-        layer1 = build_repo_map(repo_name=repo_name, workspace_path=workspace_path, commit_sha=commit_sha)
+        layer1 = build_repo_map(
+            repo_name=repo_name,
+            workspace_path=workspace_path,
+            commit_sha=commit_sha,
+            changed_files=list((state.get("current_files") or {}).keys()),
+        )
         repo_map_str = layer1["repo_map_str"]
 
         layer2 = load_knowledge_context(repo_name=repo_name, commit_sha=commit_sha)
@@ -374,10 +493,20 @@ def architecture_agent_node(state: AgentState):
                         timeout=10,
                     )
                     drift_count = int((drift_out.stdout or "0").strip() or 0)
-                    if drift_count > 100:
+                    if drift_count > 50:
                         print(
                             f"[Knowledge Map] Drift warning: knowledge map is {drift_count} commits behind ({source_commit} -> {commit_sha[:8]})."
                         )
+                    if drift_count > 200:
+                        print("[Knowledge Map] Staleness threshold exceeded (>200). Regenerating map before review.")
+                        regenerated = generate_knowledge_map(
+                            repo_name=repo_name,
+                            workspace_path=workspace_path,
+                            repo_map_str=repo_map_str,
+                            commit_sha=commit_sha,
+                            wiki_builder_llm=wiki_builder_llm,
+                        )
+                        knowledge_context_str = regenerated["knowledge_context_str"]
                 except Exception:
                     print("[Knowledge Map] Drift check skipped (non-fatal).")
         else:
@@ -397,37 +526,42 @@ def architecture_agent_node(state: AgentState):
         )
         context_to_save = context_gathered
 
+    history_block = _extract_agent_history_block("architecture", repo_name)
     final_messages = [
         SystemMessage(content=ARCHITECT_AGENT_PROMPT),
         HumanMessage(content=(
+            f"{history_block}\n\n"
+            f"{_coverage_trend_note(state.get('repo_name', 'unknown'))}\n\n"
             f"Repository: {repo_name}\n\n"
             f"Review this pull request code:\n\n{code}\n\n"
             f"Relevant codebase patterns for reference:\n{context_gathered}"
         ))
     ]
     ai_review = invoke_strict(final_messages, architecture_llm)
+    _persist_verdict(state, "architecture", ai_review)
 
     print(f"   -> Vote: {ai_review.vote}")
     safe_print_critique(ai_review.critique)
 
     return {
         "domain_approvals": {"architecture": ai_review.vote},
-        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Architecture: {ai_review.critique}"] if ai_review.vote == "rejected" else [],
+        "verdict_details": {"architecture": {"vote": ai_review.vote, "severity": ai_review.severity, "confidence": ai_review.confidence}},
+        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Architecture [{ai_review.severity}]: {ai_review.critique}"] if ai_review.vote == "rejected" else [],
         "arch_codebase_context": context_to_save
     }
 
 
 def backend_analyst_node(state: AgentState):
     """
-    Backend Analyst â€” Functional Logic Checker.
+    Backend Analyst Ã¢â‚¬â€ Functional Logic Checker.
 
     Why NO ChromaDB:
         Checks functional correctness: SQL injection risks, connection
         leak patterns, incorrect HTTP status codes, error handling.
-        These are universal backend patterns â€” no codebase comparison needed.
+        These are universal backend patterns Ã¢â‚¬â€ no codebase comparison needed.
         Uses the 70b model for its superior reasoning on complex logic.
 
-    Fix #2 â€” UAC Injection:
+    Fix #2 Ã¢â‚¬â€ UAC Injection:
         If a uac_context is present in state (from the PR description or Jira
         ticket), it is prepended to the code review prompt. This lets the
         analyst verify that the code actually implements the right feature,
@@ -435,6 +569,14 @@ def backend_analyst_node(state: AgentState):
     """
     time.sleep(2)
     repo_name = state.get("repo_name", "").lower()
+
+    if state.get("lightweight_review", False):
+        print(" Backend Analyst: Lightweight triage mode -> skipped.")
+        return {
+            "domain_approvals": {"backend": "approved"},
+            "verdict_details": {"backend": {"vote": "approved", "severity": "LOW", "confidence": 1.0}},
+            "active_critiques": [],
+        }
     
     # CROSS-DISCIPLINE REVIEW: 
     # Backend devs already wrote backend code, so the Backend Agent shouldn't review it.
@@ -442,6 +584,7 @@ def backend_analyst_node(state: AgentState):
         print(" Backend Analyst: Skipping backend repo (Cross-discipline review paradigm).")
         return {
             "domain_approvals": {"backend": "approved"},
+            "verdict_details": {"backend": {"vote": "approved", "severity": "LOW", "confidence": 1.0}},
             "active_critiques": []
         }
         
@@ -449,31 +592,34 @@ def backend_analyst_node(state: AgentState):
 
     code = format_files_for_reviewers(state.get("current_files", {}), state.get("diff_files", {}))
     uac_context = state.get("uac_context", "").strip()
+    history_block = _extract_agent_history_block("backend", state.get("repo_name", "unknown"))
 
     uac_block = (
         f"User Acceptance Criteria (UAC):\n{uac_context}\n\n"
         "Verify that the code below implements exactly what the UAC describes.\n"
-        "A feature mismatch is a CRITICAL logic flaw â€” REJECT immediately.\n\n"
+        "A feature mismatch is a CRITICAL logic flaw Ã¢â‚¬â€ REJECT immediately.\n\n"
     ) if uac_context else ""
 
     messages = [
         SystemMessage(content=BACKEND_ANALYST_AGENT_PROMPT),
-        HumanMessage(content=f"{uac_block}Review this code for functional logic issues:\n\n{code}")
+        HumanMessage(content=f"{history_block}\n\n{uac_block}Review this code for functional logic issues:\n\n{code}")
     ]
     ai_review = invoke_strict(messages, backend_llm)
+    _persist_verdict(state, "backend", ai_review)
 
     print(f"   -> Vote: {ai_review.vote}")
     safe_print_critique(ai_review.critique)
 
     return {
         "domain_approvals": {"backend": ai_review.vote},
-        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Backend: {ai_review.critique}"] if ai_review.vote == "rejected" else []
+        "verdict_details": {"backend": {"vote": ai_review.vote, "severity": ai_review.severity, "confidence": ai_review.confidence}},
+        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Backend [{ai_review.severity}]: {ai_review.critique}"] if ai_review.vote == "rejected" else []
     }
 
 
 def code_quality_agent_node(state: AgentState):
     """
-    Code Quality Agent â€” Clean Code Checker.
+    Code Quality Agent Ã¢â‚¬â€ Clean Code Checker.
 
     Why NO ChromaDB:
         Checks naming conventions, function length, docstrings, nesting
@@ -485,71 +631,89 @@ def code_quality_agent_node(state: AgentState):
     print(" Code Quality Agent: Checking for clean code...")
 
     code = format_files_for_reviewers(state.get("current_files", {}), state.get("diff_files", {}))
+    history_block = _extract_agent_history_block("code_quality", state.get("repo_name", "unknown"))
+    quality_hints = []
+    for item in state.get("rule_report", []):
+        if item.get("severity") in {"LOW", "MEDIUM"}:
+            quality_hints.append(
+                f"- {item.get('severity')} {item.get('file_path')}:{item.get('line')} {item.get('message')}"
+            )
     messages = [
         SystemMessage(content=CODE_QUALITY_AGENT_PROMPT),
-        HumanMessage(content=code)
+        HumanMessage(content=f"{history_block}\n\nDeterministic hints:\n{chr(10).join(quality_hints[:20])}\n\n{code}")
     ]
     ai_review = invoke_strict(messages, code_quality_llm)
+    _persist_verdict(state, "code_quality", ai_review)
 
     print(f"   -> Vote: {ai_review.vote}")
     safe_print_critique(ai_review.critique)
 
     return {
         "domain_approvals": {"code_quality": ai_review.vote},
-        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Code Quality: {ai_review.critique}"] if ai_review.vote == "rejected" else []
+        "verdict_details": {"code_quality": {"vote": ai_review.vote, "severity": ai_review.severity, "confidence": ai_review.confidence}},
+        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Code Quality [{ai_review.severity}]: {ai_review.critique}"] if ai_review.vote == "rejected" else []
     }
 
 
 def qa_agent_node(state):
-    """
-    QA / SDET Agent â€” Testability Checker.
- 
-    Dynamic invocation:
-        If pr_has_tests=False (set by pr_router_node because no test files
-        were found in the PR), this node self-skips immediately.
-        This saves ~300â€“500 Groq tokens per pipeline run.
- 
-    When pr_has_tests=True, runs the full coverage gate and testability review.
-    """
-    # â”€â”€ Dynamic skip gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    if not state.get("pr_has_tests", True):
-        print(" QA Agent: No test files detected â€” skipping (pr_has_tests=False).")
+    """QA / SDET Agent."""
+    if state.get("lightweight_review", False):
+        print(" QA Agent: Lightweight triage mode -> skipped.")
         return {
             "domain_approvals": {"qa": "approved"},
-            "active_critiques": [],  # empty list = no-op with wipeable_add reducer
+            "verdict_details": {"qa": {"vote": "approved", "severity": "LOW", "confidence": 1.0}},
+            "active_critiques": [],
         }
- 
-    # â”€â”€ Full review path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    if not state.get("pr_has_tests", True):
+        print(" QA Agent: No test files detected -> skipping (pr_has_tests=False).")
+        return {
+            "domain_approvals": {"qa": "approved"},
+            "verdict_details": {"qa": {"vote": "approved", "severity": "LOW", "confidence": 0.6}},
+            "active_critiques": [],
+        }
+
     time.sleep(2)
     print(" QA Agent: Checking testability and mocks...")
 
     code = format_files_for_reviewers(state.get("current_files", {}), state.get("diff_files", {}))
     uac_context = state.get("uac_context", "").strip()
- 
+    test_quality = state.get("test_quality_label", "UNKNOWN")
+    coverage_signal = float(state.get("test_coverage_signal", 0.0))
+    history_block = _extract_agent_history_block("qa", state.get("repo_name", "unknown"))
     uac_block = (
         f"User Acceptance Criteria (UAC):\n{uac_context}\n\n"
         "Also verify the test suite contains at least one test case per UAC scenario. "
         "Missing UAC coverage = REJECT.\n\n"
     ) if uac_context else ""
- 
+
     messages = [
         SystemMessage(content=QA_AGENT_PROMPT),
-        HumanMessage(content=f"{uac_block}{code}"),
+        HumanMessage(
+            content=(
+                f"{history_block}\n\n"
+                f"Test Quality: {test_quality}\n"
+                f"Coverage Signal: {coverage_signal:.2f}\n\n"
+                f"{uac_block}{code}"
+            )
+        ),
     ]
     ai_review = invoke_strict(messages, qa_llm)
- 
+    _persist_verdict(state, "qa", ai_review)
+
     print(f"   -> Vote: {ai_review.vote}")
     safe_print_critique(ai_review.critique)
- 
+
     return {
         "domain_approvals": {"qa": ai_review.vote},
-        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] QA: {ai_review.critique}"] if ai_review.vote == "rejected" else [],
+        "verdict_details": {"qa": {"vote": ai_review.vote, "severity": ai_review.severity, "confidence": ai_review.confidence}},
+        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] QA [{ai_review.severity}]: {ai_review.critique}"] if ai_review.vote == "rejected" else [],
     }
 
 
 def frontend_agent_node(state: AgentState):
     """
-    Frontend Integration Agent â€” API Contract Checker.
+    Frontend Integration Agent Ã¢â‚¬â€ API Contract Checker.
 
     Why NO ChromaDB:
         Validates that the API response matches the frontend's expected
@@ -561,6 +725,14 @@ def frontend_agent_node(state: AgentState):
     """
     time.sleep(2)
     repo_name = state.get("repo_name", "").lower()
+
+    if state.get("lightweight_review", False):
+        print(" Frontend Agent: Lightweight triage mode -> skipped.")
+        return {
+            "domain_approvals": {"frontend": "approved"},
+            "verdict_details": {"frontend": {"vote": "approved", "severity": "LOW", "confidence": 1.0}},
+            "active_critiques": [],
+        }
     
     # CROSS-DISCIPLINE REVIEW: 
     # Frontend devs already wrote frontend code, so the Frontend Agent shouldn't review it.
@@ -568,30 +740,34 @@ def frontend_agent_node(state: AgentState):
         print(" Frontend Agent: Skipping frontend repo (Cross-discipline review paradigm).")
         return {
             "domain_approvals": {"frontend": "approved"},
+            "verdict_details": {"frontend": {"vote": "approved", "severity": "LOW", "confidence": 1.0}},
             "active_critiques": []
         }
 
     print(" Frontend Agent: Checking API contract and formatting...")
 
     code = format_files_for_reviewers(state.get("current_files", {}), state.get("diff_files", {}))
+    history_block = _extract_agent_history_block("frontend", state.get("repo_name", "unknown"))
     messages = [
         SystemMessage(content=FRONTEND_AGENT_PROMPT),
-        HumanMessage(content=code)
+        HumanMessage(content=f"{history_block}\n\n{code}")
     ]
     ai_review = invoke_strict(messages, frontend_llm)
+    _persist_verdict(state, "frontend", ai_review)
 
     print(f"   -> Vote: {ai_review.vote}")
     safe_print_critique(ai_review.critique)
 
     return {
         "domain_approvals": {"frontend": ai_review.vote},
-        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Frontend: {ai_review.critique}"] if ai_review.vote == "rejected" else []
+        "verdict_details": {"frontend": {"vote": ai_review.vote, "severity": ai_review.severity, "confidence": ai_review.confidence}},
+        "active_critiques": [f"[Round {state.get('iteration_count', 0)}] Frontend [{ai_review.severity}]: {ai_review.critique}"] if ai_review.vote == "rejected" else []
     }
 
 
 def critique_resolve_agent_node(state: AgentState):
     """
-    Critique Resolve Agent â€” Conflict Resolution Brain.
+    Critique Resolve Agent Ã¢â‚¬â€ Conflict Resolution Brain.
 
     Sits between specialist consensus and the Dev Agent. Produces a single
     Master Directive by:
@@ -613,9 +789,9 @@ def critique_resolve_agent_node(state: AgentState):
 
     if not active_critiques:
         print("   -> No critiques to resolve. All agents approved.")
-        return {"master_directive": "NO_CRITIQUES â€” all agents approved."}
+        return {"master_directive": "NO_CRITIQUES Ã¢â‚¬â€ all agents approved."}
 
-    # â”€â”€ Phase 1: Programmatic Pre-Processing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ Phase 1: Programmatic Pre-Processing Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     AGENT_PRIORITY = {
         "security": 1,
         "qa": 2,
@@ -639,8 +815,8 @@ def critique_resolve_agent_node(state: AgentState):
     # Extract Round 1 critiques for loop prevention context
     round_1_critiques = [c for c in full_history if "[Round 0]" in c]
 
-    # â”€â”€ Phase 2: LLM Synthesis â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    round_1_text = "\n".join(round_1_critiques) if round_1_critiques else "(This is Round 1 â€” no prior history)"
+    # Ã¢â€â‚¬Ã¢â€â‚¬ Phase 2: LLM Synthesis Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+    round_1_text = "\n".join(round_1_critiques) if round_1_critiques else "(This is Round 1 Ã¢â‚¬â€ no prior history)"
     current_text = "\n".join(sorted_critiques)
 
     human_content = (
@@ -704,6 +880,14 @@ def development_agent_node(state: AgentState):
     # -- Build LLM prompt with Docker compiler evidence (if available) --------
     active_critiques = state.get("active_critiques", [])
     critique_log = active_critiques if active_critiques else ["No specific critiques from this round (all approved)."]
+    test_quality_label = str(state.get("test_quality_label", "UNKNOWN"))
+    test_coverage_signal = float(state.get("test_coverage_signal", 0.0))
+    test_signal_block = (
+        f"Test Quality Signal:\n"
+        f"- Label: {test_quality_label}\n"
+        f"- Coverage Signal: {test_coverage_signal:.2f}\n"
+        f"- Interpretation: {'WEAK (treat sandbox pass as low confidence)' if test_quality_label == 'LOW' else 'NORMAL'}\n\n"
+    )
 
     docker_evidence_block = (
         f"Docker Sandbox result from previous fix attempt:\n{prev_docker_result}\n\n"
@@ -714,6 +898,7 @@ def development_agent_node(state: AgentState):
     human_content = (
         f"Feedback from all reviewers:\n{chr(10).join(critique_log)}\n\n"
         f"MASTER DIRECTIVE (conflict-resolved, priority-ordered):\n{master_directive}\n\n"
+        f"{test_signal_block}"
         f"{docker_evidence_block}"
         f"{warning_text}"
         f"Please fix this codebase:\n\n{broken_code}\n\n"
@@ -817,6 +1002,7 @@ def development_agent_node(state: AgentState):
             "sandbox_workspace_path": workspace_path,
             "sandbox_test_result": "[SANDBOX] No runnable Node.js app detected (no package.json found).",
             "active_critiques": [],
+            "verdict_details": {},
             "domain_approvals": {
                 "backend": "pending", "security": "pending",
                 "architecture": "pending", "code_quality": "pending",
@@ -847,7 +1033,12 @@ def development_agent_node(state: AgentState):
             print("   [OK] npm install: SUCCESS")
             if tests_passed:
                 print("   [OK] npm test: SUCCESS")
-                sandbox_result_str = f"[SANDBOX Round {current_count + 1}] OK npm install PASSED. OK npm test PASSED."
+                sandbox_result_str = (
+                    f"[SANDBOX Round {current_count + 1}] OK npm install PASSED. OK npm test PASSED. "
+                    f"Test Quality={test_quality_label} ({test_coverage_signal:.2f})."
+                )
+                if test_quality_label == "LOW":
+                    sandbox_result_str += " LOW_SIGNAL: passing tests do not strongly validate changed code."
             else:
                 print(f"   [FAIL] npm test: FAILED (exit code {docker_result.exit_code})")
                 sandbox_result_str = (
@@ -874,6 +1065,7 @@ def development_agent_node(state: AgentState):
         "sandbox_test_result": sandbox_result_str,
         # Wipe short-term critique memory after Dev Agent has consumed it.
         "active_critiques": [],
+        "verdict_details": {},
         "domain_approvals": {
             "backend": "pending",
             "security": "pending",
@@ -886,7 +1078,7 @@ def development_agent_node(state: AgentState):
 
 def _condense_history(full_log: list, max_entries: int = 12, max_chars_per_entry: int = 120) -> str:
     """
-    Fix #4 â€” Doc Agent Token Bloat.
+    Fix #4 Ã¢â‚¬â€ Doc Agent Token Bloat.
 
     Produces a tight timeline string from the full critique history:
       - Only keeps the last `max_entries` entries (default 12) to stay well
@@ -900,7 +1092,7 @@ def _condense_history(full_log: list, max_entries: int = 12, max_chars_per_entry
     condensed = []
     for entry in full_log[-max_entries:]:
         if len(entry) > max_chars_per_entry:
-            condensed.append(entry[:max_chars_per_entry] + " [â€¦truncated]")
+            condensed.append(entry[:max_chars_per_entry] + " [Ã¢â‚¬Â¦truncated]")
         else:
             condensed.append(entry)
     return "\n".join(condensed) if condensed else "(no history recorded)"
@@ -908,7 +1100,7 @@ def _condense_history(full_log: list, max_entries: int = 12, max_chars_per_entry
 
 def documentation_summarizer_node(state: AgentState):
     """
-    Documentation Agent â€” Report Generator.
+    Documentation Agent Ã¢â‚¬â€ Report Generator.
 
     Reads structured verdicts and critiques from state and passes them
     as pre-built data blocks so the LLM copies them verbatim instead of
@@ -916,19 +1108,19 @@ def documentation_summarizer_node(state: AgentState):
 
     Sandbox Teardown:
         This node is the single convergence point for BOTH the happy-path
-        (environment_sandbox_node â†’ here) and the failure-path
-        (human_fallback_node â†’ here). Tearing down the Docker workspace here
+        (environment_sandbox_node Ã¢â€ â€™ here) and the failure-path
+        (human_fallback_node Ã¢â€ â€™ here). Tearing down the Docker workspace here
         guarantees it is called exactly once, regardless of which path was
         taken, leaving zero footprint on the host machine.
     """
     time.sleep(2)
 
-    # â”€â”€ Sandbox Teardown (called exactly once, after the 3-round loop) â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ Sandbox Teardown (called exactly once, after the 3-round loop) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     workspace_path = state.get("sandbox_workspace_path", "")
     if workspace_path:
         try:
             teardown_workspace(workspace_path)
-            print("   [Sandbox] Workspace torn down âœ“ â€” host filesystem clean.")
+            print("   [Sandbox] Workspace torn down Ã¢Å“â€œ Ã¢â‚¬â€ host filesystem clean.")
         except Exception as e:
             # Non-fatal: log and continue. The report must still be generated.
             print(f"   [Sandbox] Teardown warning (non-fatal): {e}")
@@ -940,6 +1132,9 @@ def documentation_summarizer_node(state: AgentState):
     final_code = format_files_raw(files_dict)
     final_votes = state.get("domain_approvals", {})
     iteration_count = state.get("iteration_count", 0)
+    final_verdict = state.get("final_verdict", "")
+    weighted_score = float(state.get("weighted_score", 0.0))
+    veto_reason = state.get("veto_reason", "")
 
     # -----------------------------------------------------------------------
     # Build VERDICTS table from the actual pipeline state (not from LLM guess)
@@ -1001,6 +1196,9 @@ def documentation_summarizer_node(state: AgentState):
 
     human_content = (
         f"VERDICTS:\n{verdicts_table}\n\n"
+        f"FINAL_VERDICT: {final_verdict}\n"
+        f"WEIGHTED_SCORE: {weighted_score:.2f}\n"
+        f"VETO_REASON: {veto_reason}\n\n"
         f"FINAL_CRITIQUES:\n{final_critiques_block}\n\n"
         f"HISTORY (condensed timeline):\n{condensed_history}\n\n"
         f"MASTER_DIRECTIVE (dropped critiques context):\n{master_directive}\n\n"
@@ -1026,7 +1224,7 @@ def documentation_summarizer_node(state: AgentState):
             time.sleep(3)
 
     if not report_md:
-        report_md = "âš ï¸ Could not generate the report. The LLM returned empty responses after multiple attempts."
+        report_md = "Ã¢Å¡Â Ã¯Â¸Â Could not generate the report. The LLM returned empty responses after multiple attempts."
 
     try:
         with open("report.md", "w", encoding="utf-8") as f:
@@ -1035,7 +1233,7 @@ def documentation_summarizer_node(state: AgentState):
     except Exception as e:
         print(f"   -> Error saving file: {e}")
 
-    # â”€â”€ Post results back to GitHub (Fix #12) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ Post results back to GitHub (Fix #12) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     _post_github_results(state, report_md, final_votes)
 
     return {"human_readable_summary": report_md}
@@ -1043,9 +1241,9 @@ def documentation_summarizer_node(state: AgentState):
 
 def _post_github_results(state: AgentState, report_md: str, final_votes: dict) -> None:
     """
-    Post the review summary as a PR comment and set a GitHub Check Run status.
+    Post the review summary as a PR comment and set a GitHub Commit Status.
 
-    Both calls are best-effort â€” any failure is logged but does not affect
+    Both calls are best-effort — any failure is logged but does not affect
     pipeline state or the returned report.
 
     Silently skips when:
@@ -1054,12 +1252,12 @@ def _post_github_results(state: AgentState, report_md: str, final_votes: dict) -
     """
     pr_url = state.get("pr_url", "")
     if not pr_url or "github.com" not in pr_url:
-        print("   [GitHub] Skipping posting â€” no GitHub PR URL in state (local test mode).")
+        print("   [GitHub] Skipping posting — no GitHub PR URL in state (local test mode).")
         return
 
     github_token = os.getenv("GITHUB_TOKEN", "")
     if not github_token:
-        print("   [GitHub] Skipping posting â€” GITHUB_TOKEN not set.")
+        print("   [GitHub] Skipping posting — GITHUB_TOKEN not set.")
         return
 
     # Parse https://github.com/{owner}/{repo}/pull/{number}
@@ -1082,8 +1280,8 @@ def _post_github_results(state: AgentState, report_md: str, final_votes: dict) -
     )
     conclusion = "success" if all_approved else "failure"
 
-    # Late import â€” avoids loading httpx at module-import time in tests
-    from api.github_client import post_pr_comment, create_check_run  # noqa: PLC0415
+    # Late import Ã¢â‚¬â€ avoids loading httpx at module-import time in tests
+    from api.github_client import post_pr_comment, create_commit_status  # noqa: PLC0415
 
     # 1. PR comment
     posted = post_pr_comment(repo_full_name, pr_number, report_md)
@@ -1095,20 +1293,18 @@ def _post_github_results(state: AgentState, report_md: str, final_votes: dict) -
     # 2. Check run (requires a commit SHA from state)
     commit_sha = state.get("commit_sha", "")
     if commit_sha:
-        ok = create_check_run(
+        ok = create_commit_status(
             repo=repo_full_name,
             sha=commit_sha,
-            name="AI Review",
-            conclusion=conclusion,
-            output={
-                "title": "AI Review Complete",
-                "summary": report_md[:65535],
-            },
+            state=conclusion,
+            description=f"AI Review Completed. Status: {conclusion}",
+            context="CodeSentinel / AI Review",
         )
         print(
             f"   [GitHub] Check run {'created' if ok else 'FAILED (non-fatal)'} "
             f"(conclusion={conclusion})."
         )
     else:
-        print("   [GitHub] No commit_sha in state â€” skipping check run creation.")
+        print("   [GitHub] No commit_sha in state Ã¢â‚¬â€ skipping check run creation.")
+
 

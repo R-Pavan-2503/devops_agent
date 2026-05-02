@@ -11,7 +11,7 @@ AGENT_SETTINGS_TEMPLATE: dict[str, dict[str, Any]] = {
     "architecture": {
         "display_name": "Architecture Agent",
         "size_class": "large",
-        "model": "llama-3.3-70b-versatile",
+        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
         "parameters": {
             "temperature": 0.2,
             "max_tokens": 3000,
@@ -23,7 +23,7 @@ AGENT_SETTINGS_TEMPLATE: dict[str, dict[str, Any]] = {
     "backend": {
         "display_name": "Backend Analyst",
         "size_class": "large",
-        "model": "llama-3.3-70b-versatile",
+        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
         "parameters": {
             "temperature": 0.2,
             "max_tokens": 300,
@@ -71,7 +71,7 @@ AGENT_SETTINGS_TEMPLATE: dict[str, dict[str, Any]] = {
     "frontend": {
         "display_name": "Frontend Integration Agent",
         "size_class": "small",
-        "model": "llama-3.1-8b-instant",
+        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
         "parameters": {
             "temperature": 0.2,
             "max_tokens": 300,
@@ -95,7 +95,7 @@ AGENT_SETTINGS_TEMPLATE: dict[str, dict[str, Any]] = {
     "development": {
         "display_name": "Developer Agent",
         "size_class": "large",
-        "model": "llama-3.3-70b-versatile",
+        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
         "parameters": {
             "temperature": 0.2,
             "max_tokens": 3000,
@@ -107,7 +107,7 @@ AGENT_SETTINGS_TEMPLATE: dict[str, dict[str, Any]] = {
     "documentation": {
         "display_name": "Documentation Agent",
         "size_class": "large",
-        "model": "llama-3.3-70b-versatile",
+        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
         "parameters": {
             "temperature": 0.2,
             "max_tokens": 3000,
@@ -150,6 +150,15 @@ MODEL_PRICING_PER_1M: dict[str, dict[str, float]] = {
     "llama-3.1-8b-instant": {"input": 0.05, "output": 0.08},
     "llama-3.3-70b-versatile": {"input": 0.59, "output": 0.79},
     "meta-llama/llama-4-scout-17b-16e-instruct": {"input": 0.11, "output": 0.34},
+}
+
+AGENT_VERDICT_POLICY: dict[str, dict[str, Any]] = {
+    "security": {"weight": 3.0, "has_veto": True, "veto_on": ["CRITICAL", "HIGH"]},
+    "architecture": {"weight": 2.0, "has_veto": True, "veto_on": ["CRITICAL"]},
+    "backend": {"weight": 1.5, "has_veto": False, "veto_on": []},
+    "code_quality": {"weight": 1.0, "has_veto": False, "veto_on": []},
+    "frontend": {"weight": 1.0, "has_veto": False, "veto_on": []},
+    "qa": {"weight": 1.0, "has_veto": False, "veto_on": []},
 }
 
 _lock = threading.RLock()
@@ -212,6 +221,10 @@ def _estimate_credits(model: str, prompt_tokens: int, completion_tokens: int, to
 
 def get_defaults() -> dict[str, dict[str, Any]]:
     return copy.deepcopy(AGENT_SETTINGS_TEMPLATE)
+
+
+def get_agent_verdict_policy() -> dict[str, dict[str, Any]]:
+    return copy.deepcopy(AGENT_VERDICT_POLICY)
 
 
 def reset_session() -> None:

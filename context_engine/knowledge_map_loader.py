@@ -46,6 +46,9 @@ def load_knowledge_context(repo_name: str, commit_sha: str) -> dict:
         f"[Knowledge Index: {index_path}]\n{index_text}\n"
         + "\n".join(pattern_texts)
     ).strip()
+    if len(context) > 12000:
+        omitted = len(context) - 12000
+        context = f"[TRUNCATED: {omitted} chars omitted]\n{context[:12000]}"
     print(f"[Knowledge Map] Loaded: {index_path}")
     return {
         "knowledge_context_str": context,

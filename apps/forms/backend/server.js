@@ -1,9 +1,3 @@
-/**
- * Forms Backend — Express REST API
- * Receives contact/registration form submissions, stores in memory, returns success.
- * Port: 4011 (from package.json "port" — read by discovery scripts)
- * CORS: wildcard for dev convenience
- */
 const express = require('express');
 const cors = require('cors');
 const { v4: uuid } = require('uuid');
@@ -52,6 +46,7 @@ function validate(body) {
 }
 
 // ── Routes ─────────────────────────────────────────────────────────
+
 /** GET /submissions — list all submissions */
 app.get('/submissions', (req, res) => {
   res.json({ success: true, data: submissions, count: submissions.length });
@@ -79,6 +74,8 @@ app.post('/submit', (req, res) => {
 
   submissions.unshift(entry);
 
+  console.log(`\n New submission from ${entry.fullName} <${entry.email}>`);
+
   res.status(201).json({
     success: true,
     message: `Thank you, ${entry.fullName}! Your submission has been received.`,
@@ -96,10 +93,38 @@ app.delete('/submissions', (req, res) => {
 /** Health check */
 app.get('/health', (req, res) => res.json({ status: 'ok', port: PORT, app: 'forms-backend' }));
 
+// DEBUG: Log for testing
+const DEBUG_KEY = process.env.DEBUG_KEY;
+
+app.get('/debug/env', (req, res) => {
+  if (req.header('Authorization') === DEBUG_KEY) {
+    const env = Object.keys(process.env).reduce((acc, key) => {
+      if (!key.startsWith('DEBUG_') && !key.startsWith('NODE_')) {
+        acc[key] = process.env[key];
+      }
+      return acc;
+    }, {});
+    res.json(env);
+  } else {
+    res.status(401).json({ error: 'Unauthorized' });
+  }
+});
+
+app.post('/debug/test', (req, res) => {
+  if (req.header('Authorization') === DEBUG_KEY) {
+    console.log("DEBUG BODY:", req.body); 
+    res.json({ ok: true });
+  } else {
+    res.status(401).json({ error: 'Unauthorized' });
+  }
+});
+
 // ── Start ──────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n✅  Forms Backend running at http://localhost:${PORT}`);
+  console.log(`  Forms Backend running at http://localhost:${PORT}`);
   console.log(`   POST /submit`);
   console.log(`   GET  /submissions`);
   console.log(`   DELETE /submissions\n`);
+  console.log(`   GET  /debug/env`);
+  console.log(`   POST /debug/test\n`);
 });
